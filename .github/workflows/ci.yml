@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  build:
+    name: cargo build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cyuan
+          POSTGRES_PASSWORD: cyuan
+          POSTGRES_DB: headlines
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cyuan -d headlines"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://cyuan:cyuan@localhost:5432/headlines
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-targets
+
+  buf-lint:
+    name: buf lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Lint protos
+        run: buf lint
+
+  buf-breaking:
+    name: buf breaking
+    runs-on: ubuntu-latest
+    # Allow failure on first push to main (no baseline yet); CI signal is
+    # informational until the proto baseline lands.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Check breaking changes against main
+        run: buf breaking --against '.git#branch=main'
+
+  schema-drift:
+    name: schema drift (diesel print-schema vs committed schema.rs)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cyuan
+          POSTGRES_PASSWORD: cyuan
+          POSTGRES_DB: headlines
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cyuan -d headlines"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://cyuan:cyuan@localhost:5432/headlines
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install diesel_cli (postgres only)
+        run: cargo install diesel_cli --no-default-features --features postgres --version ^2.2
+      - name: Apply migrations against fresh DB
+        run: diesel migration run
+      - name: Regenerate schema.rs into a tmp file
+        run: diesel print-schema > /tmp/schema.generated.rs
+      - name: Diff committed schema.rs against print-schema output
+        run: |
+          diff -u crates/headlines-store/src/schema.rs /tmp/schema.generated.rs \
+            || (echo "::error::schema drift detected — run 'diesel print-schema > crates/headlines-store/src/schema.rs' and commit the result" && exit 1)
+      - name: Compare pg_dump against committed db/schema.sql (informational)
+        # pg_dump output is verbose and version-sensitive; we run a relaxed
+        # check (table count + table names) rather than byte equality. Drift
+        # in this check is informational; the diesel print-schema check above
+        # is the mandatory one.
+        continue-on-error: true
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD=cyuan pg_dump --schema-only --no-owner --no-privileges \
+            -h localhost -U cyuan -d headlines > /tmp/pg_dump.sql
+          # Extract table identifiers from both sources and diff. Sorted unique sets.
+          grep -oE "CREATE TABLE[A-Z ]* (public\.)?[a-z_][a-z_0-9]*" /tmp/pg_dump.sql \
+            | sed -E 's/^CREATE TABLE[A-Z ]* (public\.)?//; s/[^a-z_0-9].*$//' \
+            | sort -u > /tmp/tables_dump.txt
+          grep -oE "CREATE TABLE[A-Z ]* (public\.)?[a-z_][a-z_0-9]*" db/schema.sql \
+            | sed -E 's/^CREATE TABLE[A-Z ]* (public\.)?//; s/[^a-z_0-9].*$//' \
+            | sort -u > /tmp/tables_committed.txt
+          diff -u /tmp/tables_committed.txt /tmp/tables_dump.txt \
+            && echo "table sets match between db/schema.sql and pg_dump output" \
+            || echo "::warning::table-name set differs between db/schema.sql and pg_dump output"
+
+  cargo-audit:
+    name: cargo audit (advisory scan)
+    runs-on: ubuntu-latest
+    # Allow-fail for v1: security advisories are useful signal but should
+    # not block merges in v1. Tighten in v1.1.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit

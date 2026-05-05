@@ -1,0 +1,24 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local config / secrets
+.env
+.env.local
+config.local.toml
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Generated proto outputs (buf generate). The negation only works when the
+# directory itself is not ignored — so we ignore its contents instead.
+/gen/*
+# Keep the committed OpenAPI artifact for the REST gateway to serve.
+!/gen/openapi
+!/gen/openapi/**
+
