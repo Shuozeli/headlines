@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// FeedItem carries an `ArticleSummary` per `feed-recommendation.md` so list
+// callers don't pay for content nodes; clients call `GetArticle` for the body.
+message FeedItem {
+  int32 position = 1;
+  ArticleSummary article = 2;
+}
+
+// FeedRecommendationService — see `docs/design/feed-recommendation.md` for
+// the canonical spec (validation rules, error reasons, behavior, pagination
+// semantics). Authorization is encoded directly on each RPC via the
+// `auth_requirement` MethodOption and consumed by the proto-driven
+// `AUTH_TABLE` (see `docs/design/architecture.md` "Proto-driven authorization").
+//
+// Naming note: the request/response messages use the verbose
+// `ReplaceRecommendationFeed*` form rather than the bare `Replace*` form.
+// `Replace` clashes with reserved descriptor naming in `protoc` once the
+// service is added to the same package, mirroring the `Follow`-vs-`FollowRequest`
+// quirk noted in implementation-issues.md.
+service FeedRecommendationService {
+  // ReplaceRecommendationFeed atomically deletes the existing feed for the
+  // user and inserts the supplied ordered list (position = index). System-only
+  // by design — the ranker is the only writer.
+  //
+  // Authorization: System with `feeds.recommendation.write`.
+  rpc ReplaceRecommendationFeed(ReplaceRecommendationFeedRequest)
+      returns (ReplaceRecommendationFeedResponse) {
+    option (google.api.http) = {
+      put: "/v1/users/{user_id}/feed/recommendation"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["feeds.recommendation.write"]
+    };
+  }
+
+  // GetRecommendationFeed returns the joined feed view for the user. The
+  // join against `articles_live` automatically excludes tombstoned and
+  // missing articles (see `feed-recommendation.md` for details).
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `feeds.recommendation.read`.
+  rpc GetRecommendationFeed(GetRecommendationFeedRequest)
+      returns (GetRecommendationFeedResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/feed/recommendation"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["feeds.recommendation.read"]
+    };
+  }
+}
+
+message ReplaceRecommendationFeedRequest {
+  string user_id = 1;
+  // Order is the feed order; position = index. Soft references — the ranker
+  // may push article ids ahead of article ingestion.
+  repeated string article_ids = 2;
+}
+
+message ReplaceRecommendationFeedResponse {
+  int32 stored_count = 1;
+}
+
+message GetRecommendationFeedRequest {
+  string user_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message GetRecommendationFeedResponse {
+  repeated FeedItem items = 1;
+  string next_page_token = 2;
+}

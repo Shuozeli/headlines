@@ -1,0 +1,27 @@
+[package]
+name = "headlines-rest-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+
+[dependencies]
+headlines-proto.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tonic.workspace = true
+hyper.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+prost-types.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

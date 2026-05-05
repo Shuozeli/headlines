@@ -1,0 +1,29 @@
+[package]
+name = "headlines-store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+
+[dependencies]
+headlines-core.workspace = true
+diesel.workspace = true
+diesel-async.workspace = true
+deadpool.workspace = true
+diesel_migrations.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serial_test.workspace = true

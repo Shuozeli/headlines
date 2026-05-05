@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// UserStatus mirrors `users.status` per `docs/design/data-model.md`.
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_DELETED = 2;
+}
+
+// User is the consumer identity row. `id` is a UUIDv7.
+message User {
+  string id = 1;
+  string display_name = 2;
+  UserStatus status = 3;
+  google.protobuf.Timestamp deleted_at = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+// UserKey mirrors `user_keys` per `docs/design/data-model.md`.
+message UserKey {
+  string user_id = 1;
+  string key_id = 2;
+  string algo = 3;
+  string public_key = 4;
+  KeyStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp revoked_at = 7;
+}
+
+// UserService — see `docs/design/users.md` for the canonical spec
+// (validation rules, error reasons, behavior). Authorization is encoded
+// directly on each RPC via the `auth_requirement` MethodOption and consumed
+// by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+service UserService {
+  // CreateUser mints a new user + initial key.
+  //
+  // Authorization: in `open` bootstrap mode, anonymous callers may
+  // self-register. In `system_only` mode, only systems with `users.write`
+  // may create users on a user's behalf. The proto allows BOTH; the
+  // service handler rejects anonymous calls when bootstrap mode is
+  // `system_only` with `REGISTRATION_DISABLED` (PERMISSION_DENIED).
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse) {
+    option (google.api.http) = {
+      post: "/v1/users"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ANONYMOUS, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.write"]
+    };
+  }
+
+  // GetUser returns the user row, including soft-deleted rows
+  // (status=DELETED, 200 — never NOT_FOUND for self/system).
+  //
+  // Privacy: GetUser is NOT anonymous. Unauthorized callers receive
+  // `USER_NOT_FOUND` (NOT_FOUND) — not PERMISSION_DENIED — so the API
+  // does not leak user existence.
+  rpc GetUser(GetUserRequest) returns (User) {
+    option (google.api.http) = {
+      get: "/v1/users/{id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.read"]
+    };
+  }
+
+  // UpdateUser applies a field-masked update.
+  //
+  // Authorization: USER_SELF OR System with `users.admin`. Cross-user
+  // writes are rejected by the handler with `USER_NOT_FOUND`.
+  rpc UpdateUser(UpdateUserRequest) returns (User) {
+    option (google.api.http) = {
+      patch: "/v1/users/{user.id}"
+      body: "user"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.admin"]
+    };
+  }
+
+  // DeleteUser soft-deletes the user.
+  //
+  // Authorization: USER_SELF (self-delete) OR System with `users.delete`.
+  rpc DeleteUser(DeleteUserRequest) returns (User) {
+    option (google.api.http) = {
+      delete: "/v1/users/{id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.delete"]
+    };
+  }
+
+  // AddUserKey registers an additional active key on a user.
+  //
+  // Authorization: USER_SELF OR System with `users.admin`.
+  rpc AddUserKey(AddUserKeyRequest) returns (UserKey) {
+    option (google.api.http) = {
+      post: "/v1/users/{user_id}/keys"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.admin"]
+    };
+  }
+
+  // RevokeUserKey marks an existing key as revoked.
+  //
+  // Authorization: USER_SELF OR System with `users.admin`.
+  // Lockout protection: the handler refuses to revoke the last active key
+  // unless the caller is a System with `admin.*` scope (operator rescue).
+  rpc RevokeUserKey(RevokeUserKeyRequest) returns (UserKey) {
+    option (google.api.http) = {
+      post: "/v1/users/{user_id}/keys/{key_id}/revoke"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["users.admin"]
+    };
+  }
+}
+
+message CreateUserRequest {
+  string display_name = 1;
+  PublicKey initial_key = 2;
+}
+
+message CreateUserResponse {
+  User user = 1;
+  string key_id = 2;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message UpdateUserRequest {
+  User user = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+message DeleteUserRequest {
+  string id = 1;
+}
+
+message AddUserKeyRequest {
+  string user_id = 1;
+  PublicKey key = 2;
+}
+
+message RevokeUserKeyRequest {
+  string user_id = 1;
+  string key_id = 2;
+}

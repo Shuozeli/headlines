@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// SubjectClass mirrors `headlines_core::SubjectClass` and is the coarse-grained
+// classification used by the proto-driven `AUTH_TABLE` to express which subject
+// kinds are allowed to invoke an RPC.
+//
+// See `docs/design/auth.md` and `docs/design/architecture.md`
+// (section "Proto-driven authorization").
+enum SubjectClass {
+  SUBJECT_CLASS_UNSPECIFIED = 0;
+  SUBJECT_CLASS_ANONYMOUS = 1;
+  SUBJECT_CLASS_USER_SELF = 2;
+  SUBJECT_CLASS_ACCOUNT_SELF = 3;
+  SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE = 4;
+  SUBJECT_CLASS_SYSTEM = 5;
+}
+
+// AuthRequirement is the value attached to each RPC method via the
+// `auth_requirement` MethodOption. The build script in
+// `crates/headlines-proto/build.rs` consumes the file descriptor set and
+// projects this into the Rust `AUTH_TABLE` consulted by `AuthorizationLayer`.
+//
+// `required_scopes` is meaningful only when `SUBJECT_CLASS_SYSTEM` is included
+// in `allowed_subjects`; for non-System subjects the list is ignored.
+message AuthRequirement {
+  repeated SubjectClass allowed_subjects = 1;
+  repeated string required_scopes = 2;
+}
+
+extend google.protobuf.MethodOptions {
+  // Custom MethodOption carrying the authorization requirement for the RPC.
+  // Field number 50001 is in the user-defined extension range and is reserved
+  // for this project's options namespace.
+  optional AuthRequirement auth_requirement = 50001;
+}

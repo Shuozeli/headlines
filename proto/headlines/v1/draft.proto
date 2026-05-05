@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// DraftService — see `docs/design/drafts.md` for the canonical spec
+// (validation rules, error reasons, behavior). Authorization is encoded
+// directly on each RPC via the `auth_requirement` MethodOption and consumed
+// by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+//
+// Drafts are publisher-side working space: mutable in place, hard-deleted
+// on `DeleteDraft`, and convert to a live article via `PublishDraft` —
+// preserving the same UUID through the publish transition.
+service DraftService {
+  // CreateDraft mints a new draft for the given account.
+  //
+  // Authorization: the Account whose id == request.account_id (so the
+  // ACCOUNT_OWNS_RESOURCE class) OR a System with `drafts.write`.
+  rpc CreateDraft(CreateDraftRequest) returns (Draft) {
+    option (google.api.http) = {
+      post: "/v1/accounts/{account_id}/drafts"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["drafts.write"]
+    };
+  }
+
+  // GetDraft returns the full draft. Drafts are private working space; a
+  // caller who does not own the draft (or a System with `drafts.read`)
+  // receives `DRAFT_NOT_FOUND` rather than `PERMISSION_DENIED` — no
+  // existence leak.
+  rpc GetDraft(GetDraftRequest) returns (Draft) {
+    option (google.api.http) = { get: "/v1/drafts/{id}" };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["drafts.read"]
+    };
+  }
+
+  // UpdateDraft applies a field-masked update to an existing draft. The
+  // resulting record is re-validated strictly per `drafts.md`.
+  //
+  // Authorization: the Account who owns the draft OR a System with
+  // `drafts.write`.
+  rpc UpdateDraft(UpdateDraftRequest) returns (Draft) {
+    option (google.api.http) = {
+      patch: "/v1/drafts/{draft.id}"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["drafts.write"]
+    };
+  }
+
+  // DeleteDraft hard-deletes a draft (no tombstone — drafts were never
+  // public).
+  //
+  // Authorization: the Account who owns the draft OR a System with
+  // `drafts.write`.
+  rpc DeleteDraft(DeleteDraftRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/drafts/{id}" };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["drafts.write"]
+    };
+  }
+
+  // ListAccountDrafts lists an account's drafts, ordered by
+  // `updated_at DESC`.
+  //
+  // Authorization: the Account whose id == request.account_id OR a
+  // System with `drafts.read`.
+  rpc ListAccountDrafts(ListAccountDraftsRequest)
+      returns (ListAccountDraftsResponse) {
+    option (google.api.http) = { get: "/v1/accounts/{account_id}/drafts" };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["drafts.read"]
+    };
+  }
+
+  // PublishDraft converts the draft to a live Article in a single
+  // transaction, preserving the UUID.
+  //
+  // Authorization: the Account who owns the draft OR a System with
+  // `articles.write` (this RPC produces an Article).
+  rpc PublishDraft(PublishDraftRequest) returns (Article) {
+    option (google.api.http) = {
+      post: "/v1/drafts/{id}/publish"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.write"]
+    };
+  }
+}
+
+// Full Draft view, including content nodes.
+//
+// `id` is a UUIDv7 minted on `CreateDraft`; the same UUID becomes
+// `articles.id` on `PublishDraft`.
+message Draft {
+  string id = 1;
+  string account_id = 2;
+  string title = 3;
+  string author_name = 4;
+  string author_url = 5;
+  repeated Node content = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// Compact view used by list endpoints. No content nodes; clients fetch
+// `GetDraft` for the full body.
+message DraftSummary {
+  string id = 1;
+  string account_id = 2;
+  string title = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message CreateDraftRequest {
+  string account_id = 1;
+  string title = 2;
+  string author_name = 3;
+  string author_url = 4;
+  repeated Node content = 5;
+}
+
+message GetDraftRequest {
+  string id = 1;
+}
+
+message UpdateDraftRequest {
+  Draft draft = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+message DeleteDraftRequest {
+  string id = 1;
+}
+
+message ListAccountDraftsRequest {
+  string account_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListAccountDraftsResponse {
+  repeated DraftSummary items = 1;
+  string next_page_token = 2;
+}
+
+message PublishDraftRequest {
+  string id = 1;
+}

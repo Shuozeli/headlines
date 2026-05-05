@@ -1,0 +1,55 @@
+[package]
+name = "headlines-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "headlines-server"
+path = "src/main.rs"
+
+[dependencies]
+headlines-core.workspace = true
+headlines-auth.workspace = true
+headlines-api.workspace = true
+headlines-rest-gateway.workspace = true
+headlines-store.workspace = true
+headlines-proto.workspace = true
+
+# --- Async / runtime ---
+tokio.workspace = true
+tokio-stream.workspace = true
+
+# --- gRPC + HTTP ---
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http.workspace = true
+axum.workspace = true
+
+# --- Config / CLI ---
+clap.workspace = true
+figment = { workspace = true, features = ["toml", "env"] }
+serde.workspace = true
+
+# --- Errors ---
+anyhow.workspace = true
+thiserror.workspace = true
+
+# --- Observability ---
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "metrics"] }
+tracing-opentelemetry.workspace = true
+tonic-types.workspace = true
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+figment = { workspace = true, features = ["toml", "env", "test"] }

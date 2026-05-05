@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+// PublicKey carries an algorithm name plus the base64-encoded raw key bytes.
+// The exact format of `public_key` is defined by `algo` (e.g. for `ed25519`,
+// the bytes are the 32-byte raw public key, base64-encoded → 44 chars).
+message PublicKey {
+  string algo = 1;
+  string public_key = 2;
+}
+
+enum KeyStatus {
+  KEY_STATUS_UNSPECIFIED = 0;
+  KEY_STATUS_ACTIVE = 1;
+  KEY_STATUS_REVOKED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Telegraph Node payload (recursive article body representation)
+// ---------------------------------------------------------------------------
+
+// Node is a recursive structured payload mirroring Telegraph's Node tree.
+// Either a text leaf or an element with attributes and children.
+message Node {
+  oneof kind {
+    string text = 1;
+    NodeElement element = 2;
+  }
+}
+
+message NodeElement {
+  string tag = 1;
+  map<string, string> attrs = 2;
+  repeated Node children = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Articles
+// ---------------------------------------------------------------------------
+
+enum ArticleState {
+  ARTICLE_STATE_UNSPECIFIED = 0;
+  ARTICLE_STATE_LIVE = 1;
+  ARTICLE_STATE_TOMBSTONE = 2;
+}
+
+// Full Article view, including content nodes when live.
+//
+// `id` is a UUIDv7 used directly as the public URL identifier (no slug).
+message Article {
+  string id = 1;
+  string account_id = 2;
+  ArticleState state = 3;
+  google.protobuf.Timestamp created_at = 4;
+  oneof state_data {
+    ArticleLive live = 5;
+    ArticleTombstone tombstone = 6;
+  }
+}
+
+message ArticleLive {
+  int32 current_version = 1;
+  string title = 2;
+  string author_name = 3;
+  string author_url = 4;
+  // Empty when the current version's content has been redacted.
+  repeated Node content = 5;
+  // True when the current version's content has been redacted.
+  bool redacted = 6;
+  google.protobuf.Timestamp published_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message ArticleTombstone {
+  string reason = 1;
+  google.protobuf.Timestamp tombstoned_at = 2;
+}
+
+// Compact view used by list/feed endpoints. Identical structure to `Article`
+// minus the content nodes; clients fetch `GetArticle` for the full body.
+message ArticleSummary {
+  string id = 1;
+  string account_id = 2;
+  ArticleState state = 3;
+  google.protobuf.Timestamp created_at = 4;
+  oneof state_data {
+    ArticleLiveSummary live = 5;
+    ArticleTombstoneSummary tombstone = 6;
+  }
+}
+
+message ArticleLiveSummary {
+  int32 current_version = 1;
+  string title = 2;
+  string author_name = 3;
+  string author_url = 4;
+  bool redacted = 5;
+  google.protobuf.Timestamp published_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ArticleTombstoneSummary {
+  string reason = 1;
+  google.protobuf.Timestamp tombstoned_at = 2;
+}
+
+// Edit envelope used by EditArticle. Fields not selected by the caller's
+// FieldMask are ignored; see `docs/design/articles.md`.
+message ArticleEdit {
+  string title = 1;
+  string author_name = 2;
+  string author_url = 3;
+  repeated Node content = 4;
+}

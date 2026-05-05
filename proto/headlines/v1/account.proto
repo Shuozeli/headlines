@@ -1,0 +1,175 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// AccountStatus mirrors `accounts.status` per `docs/design/data-model.md`.
+enum AccountStatus {
+  ACCOUNT_STATUS_UNSPECIFIED = 0;
+  ACCOUNT_STATUS_ACTIVE = 1;
+  ACCOUNT_STATUS_DELETED = 2;
+}
+
+// Account is the publisher identity row. `id` is a UUIDv7.
+message Account {
+  string id = 1;
+  string short_name = 2;
+  string author_name = 3;
+  string author_url = 4;
+  AccountStatus status = 5;
+  google.protobuf.Timestamp deleted_at = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// AccountKey mirrors `account_keys` per `docs/design/data-model.md`.
+message AccountKey {
+  string account_id = 1;
+  string key_id = 2;
+  string algo = 3;
+  string public_key = 4;
+  KeyStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp revoked_at = 7;
+}
+
+// AccountService — see `docs/design/accounts.md` for the canonical spec
+// (validation rules, error reasons, behavior). Authorization is encoded
+// directly on each RPC via the `auth_requirement` MethodOption and consumed
+// by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+service AccountService {
+  // CreateAccount mints a new account + initial key.
+  //
+  // Authorization: in `open` bootstrap mode, anonymous callers may
+  // self-register. In `system_only` mode, only systems with `accounts.write`
+  // may create accounts on a user's behalf. The proto allows BOTH; the
+  // service handler rejects anonymous calls when bootstrap mode is
+  // `system_only` with `REGISTRATION_DISABLED` (PERMISSION_DENIED).
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse) {
+    option (google.api.http) = {
+      post: "/v1/accounts"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ANONYMOUS, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["accounts.write"]
+    };
+  }
+
+  // GetAccount returns the full account row, including soft-deleted rows
+  // (status=DELETED, 200 — never NOT_FOUND). Anonymous-readable per `auth.md`.
+  rpc GetAccount(GetAccountRequest) returns (Account) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [
+        SUBJECT_CLASS_ANONYMOUS,
+        SUBJECT_CLASS_USER_SELF,
+        SUBJECT_CLASS_ACCOUNT_SELF,
+        SUBJECT_CLASS_SYSTEM
+      ]
+    };
+  }
+
+  // UpdateAccount applies a field-masked update.
+  //
+  // Authorization: ACCOUNT-owns-resource (account self) OR System with
+  // `accounts.admin`. Cross-account writes are rejected by the handler.
+  rpc UpdateAccount(UpdateAccountRequest) returns (Account) {
+    option (google.api.http) = {
+      patch: "/v1/accounts/{account.id}"
+      body: "account"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["accounts.admin"]
+    };
+  }
+
+  // DeleteAccount soft-deletes the account.
+  //
+  // Authorization: ACCOUNT_SELF (self-delete) OR System with
+  // `accounts.delete`.
+  rpc DeleteAccount(DeleteAccountRequest) returns (Account) {
+    option (google.api.http) = {
+      delete: "/v1/accounts/{id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["accounts.delete"]
+    };
+  }
+
+  // AddAccountKey registers an additional active key on an account.
+  //
+  // Authorization: account self OR System with `accounts.admin`.
+  rpc AddAccountKey(AddAccountKeyRequest) returns (AccountKey) {
+    option (google.api.http) = {
+      post: "/v1/accounts/{account_id}/keys"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["accounts.admin"]
+    };
+  }
+
+  // RevokeAccountKey marks an existing key as revoked.
+  //
+  // Authorization: account self OR System with `accounts.admin`.
+  // Lockout protection: the handler refuses to revoke the last active key
+  // unless the caller is a System with `admin.*` scope (operator rescue).
+  rpc RevokeAccountKey(RevokeAccountKeyRequest) returns (AccountKey) {
+    option (google.api.http) = {
+      post: "/v1/accounts/{account_id}/keys/{key_id}/revoke"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["accounts.admin"]
+    };
+  }
+}
+
+message CreateAccountRequest {
+  string short_name = 1;
+  string author_name = 2;
+  string author_url = 3;
+  PublicKey initial_key = 4;
+}
+
+message CreateAccountResponse {
+  Account account = 1;
+  string key_id = 2;
+}
+
+message GetAccountRequest {
+  string id = 1;
+}
+
+message UpdateAccountRequest {
+  Account account = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+message DeleteAccountRequest {
+  string id = 1;
+}
+
+message AddAccountKeyRequest {
+  string account_id = 1;
+  PublicKey key = 2;
+}
+
+message RevokeAccountKeyRequest {
+  string account_id = 1;
+  string key_id = 2;
+}

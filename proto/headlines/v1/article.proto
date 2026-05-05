@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// ArticleService — see `docs/design/articles.md` for the canonical spec
+// (validation rules, error reasons, behavior). Authorization is encoded
+// directly on each RPC via the `auth_requirement` MethodOption and consumed
+// by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+//
+// Article messages (`Article`, `ArticleSummary`, `ArticleLive`,
+// `ArticleTombstone`, `ArticleEdit`, `Node`, `NodeElement`, `ArticleState`)
+// are defined in `common.proto`.
+service ArticleService {
+  // PublishArticle creates a new live article in one shot.
+  //
+  // Authorization: the Account whose id == request.account_id (so the
+  // ACCOUNT_OWNS_RESOURCE class) OR a System with `articles.write`.
+  rpc PublishArticle(PublishArticleRequest) returns (Article) {
+    option (google.api.http) = {
+      post: "/v1/accounts/{account_id}/articles"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.write"]
+    };
+  }
+
+  // GetArticle returns the full article, including content nodes if live
+  // and the current version is not redacted. Tombstoned articles return
+  // 200 with `state=ARTICLE_STATE_TOMBSTONE`. Anonymous-readable.
+  rpc GetArticle(GetArticleRequest) returns (Article) {
+    option (google.api.http) = {
+      get: "/v1/articles/{id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [
+        SUBJECT_CLASS_ANONYMOUS,
+        SUBJECT_CLASS_USER_SELF,
+        SUBJECT_CLASS_ACCOUNT_SELF,
+        SUBJECT_CLASS_SYSTEM
+      ]
+    };
+  }
+
+  // ListAccountArticles lists an account's articles in `created_at DESC`
+  // order. Anonymous-readable.
+  rpc ListAccountArticles(ListAccountArticlesRequest)
+      returns (ListAccountArticlesResponse) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}/articles"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [
+        SUBJECT_CLASS_ANONYMOUS,
+        SUBJECT_CLASS_USER_SELF,
+        SUBJECT_CLASS_ACCOUNT_SELF,
+        SUBJECT_CLASS_SYSTEM
+      ]
+    };
+  }
+
+  // EditArticle applies a field-masked edit, creating a new
+  // article_versions row and bumping `articles_live.current_version`.
+  //
+  // Authorization: the Account who owns the article OR System with
+  // `articles.write`.
+  rpc EditArticle(EditArticleRequest) returns (Article) {
+    option (google.api.http) = {
+      patch: "/v1/articles/{id}"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.write"]
+    };
+  }
+
+  // TombstoneArticle is a one-way state transition (no untombstone).
+  //
+  // Authorization: the Account who owns the article OR System with
+  // `articles.tombstone`.
+  rpc TombstoneArticle(TombstoneArticleRequest) returns (Article) {
+    option (google.api.http) = {
+      post: "/v1/articles/{id}/tombstone"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_OWNS_RESOURCE, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.tombstone"]
+    };
+  }
+
+  // RedactArticleVersion is the compliance-redaction RPC. System-only;
+  // operators with `articles.redact` perform the call. No account
+  // self-redaction in v1.
+  rpc RedactArticleVersion(RedactArticleVersionRequest)
+      returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v1/articles/{article_id}/versions/{version}/redact"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.redact"]
+    };
+  }
+}
+
+message PublishArticleRequest {
+  string account_id = 1;
+  string title = 2;
+  string author_name = 3;
+  string author_url = 4;
+  repeated Node content = 5;
+}
+
+message GetArticleRequest {
+  string id = 1;
+}
+
+message ListAccountArticlesRequest {
+  string account_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  bool include_tombstoned = 4; // default false
+}
+
+message ListAccountArticlesResponse {
+  // No content nodes; clients call GetArticle for the full body.
+  repeated ArticleSummary items = 1;
+  string next_page_token = 2;
+}
+
+message EditArticleRequest {
+  string id = 1;
+  ArticleEdit edit = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message TombstoneArticleRequest {
+  string id = 1;
+  string reason = 2; // optional, ≤512 chars
+}
+
+message RedactArticleVersionRequest {
+  string article_id = 1;
+  int32 version = 2;
+  string redaction_reason = 3; // required, 1..=512 chars
+}

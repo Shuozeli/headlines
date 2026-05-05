@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+import "headlines/v1/options.proto";
+
+// FollowStatus mirrors `follows.status` per `docs/design/data-model.md`.
+enum FollowStatus {
+  FOLLOW_STATUS_UNSPECIFIED = 0;
+  FOLLOW_STATUS_ACTIVE = 1;
+  FOLLOW_STATUS_UNFOLLOWED = 2;
+}
+
+// Follow is one `(user, account)` edge per `docs/design/follows.md`.
+message Follow {
+  string user_id = 1;
+  string account_id = 2;
+  FollowStatus status = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp unfollowed_at = 5;
+}
+
+// FollowService — see `docs/design/follows.md` for the canonical spec
+// (validation rules, error reasons, behavior). Authorization is encoded
+// directly on each RPC via the `auth_requirement` MethodOption and consumed
+// by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+service FollowService {
+  // Follow creates or re-activates a `(user_id, account_id)` edge per
+  // `follows.md` state machine. Idempotent in the active direction; a
+  // previously `unfollowed` row resets `created_at = now`.
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `follows.write`. Cross-user attempts return `USER_NOT_FOUND`.
+  rpc Follow(FollowRequest) returns (headlines.v1.Follow) {
+    option (google.api.http) = {
+      post: "/v1/users/{user_id}/follows"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["follows.write"]
+    };
+  }
+
+  // Unfollow flips an `active` edge to `unfollowed`. No-op success on an
+  // already-unfollowed row; `FOLLOW_NOT_FOUND` if no edge has ever
+  // existed.
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `follows.write`.
+  rpc Unfollow(UnfollowRequest) returns (headlines.v1.Follow) {
+    option (google.api.http) = {
+      delete: "/v1/users/{user_id}/follows/{account_id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["follows.write"]
+    };
+  }
+
+  // GetFollow returns the edge regardless of status. Missing → `FOLLOW_NOT_FOUND`.
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `follows.read`.
+  rpc GetFollow(GetFollowRequest) returns (headlines.v1.Follow) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/follows/{account_id}"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["follows.read"]
+    };
+  }
+
+  // ListUserFollows returns the follows owned by a user, ordered by
+  // `created_at DESC`. `include_unfollowed=false` (default) hides
+  // `unfollowed` rows.
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `follows.read`.
+  rpc ListUserFollows(ListUserFollowsRequest) returns (ListUserFollowsResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/follows"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["follows.read"]
+    };
+  }
+
+  // ListAccountFollowers returns the followers of an account, ordered by
+  // `created_at DESC`. `include_unfollowed=false` (default) hides
+  // `unfollowed` rows. No filtering for deleted users — see `follows.md`.
+  //
+  // Authorization: the Account whose `id == request.account_id` OR a
+  // System with `follows.read`.
+  rpc ListAccountFollowers(ListAccountFollowersRequest)
+      returns (ListAccountFollowersResponse) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}/followers"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_ACCOUNT_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["follows.read"]
+    };
+  }
+}
+
+message FollowRequest {
+  string user_id = 1;
+  string account_id = 2;
+}
+
+message UnfollowRequest {
+  string user_id = 1;
+  string account_id = 2;
+}
+
+message GetFollowRequest {
+  string user_id = 1;
+  string account_id = 2;
+}
+
+message ListUserFollowsRequest {
+  string user_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  bool include_unfollowed = 4;
+}
+
+message ListUserFollowsResponse {
+  repeated Follow items = 1;
+  string next_page_token = 2;
+}
+
+message ListAccountFollowersRequest {
+  string account_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  bool include_unfollowed = 4;
+}
+
+message ListAccountFollowersResponse {
+  repeated Follow items = 1;
+  string next_page_token = 2;
+}

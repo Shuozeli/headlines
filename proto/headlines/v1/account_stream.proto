@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// AccountStreamItem carries an `ArticleSummary` per `account-stream.md`. The
+// summary's `state` discriminator already distinguishes LIVE from TOMBSTONE,
+// so republishers consume one shape and dispatch on `state` (mirror to target
+// platform on LIVE; remove on TOMBSTONE). Body content is fetched separately
+// via `GetArticle` to honor the list-vs-view rule.
+message AccountStreamItem {
+  ArticleSummary article = 1;
+}
+
+// AccountStreamService — see `docs/design/account-stream.md` for the canonical
+// spec (validation rules, error reasons, behavior, pagination semantics).
+// Authorization is encoded directly on each RPC via the `auth_requirement`
+// MethodOption and consumed by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+//
+// Pull-only watermark feed for downstream republishers (Twitter, YouTube,
+// Toutiao bots, etc.). One stream per account; ASC keyset cursor on
+// `event_at = COALESCE(articles_live.updated_at, articles_tombstone.tombstoned_at)`.
+service AccountStreamService {
+  // StreamAccountArticles returns the per-account watermark feed in ASC
+  // order. Each event corresponds to a publish, edit, current-version
+  // redaction (which bumps `articles_live.updated_at`), or tombstone.
+  // Drafts never appear. Ordering is `(event_at, article_id) ASC`.
+  //
+  // The stream **closes** on account deletion: the RPC surfaces
+  // `ACCOUNT_DELETED` and republishers MUST remove all content from that
+  // account on their target platform.
+  //
+  // Authorization: System with `articles.stream`.
+  rpc StreamAccountArticles(StreamAccountArticlesRequest)
+      returns (StreamAccountArticlesResponse) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}/article-stream"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["articles.stream"]
+    };
+  }
+}
+
+message StreamAccountArticlesRequest {
+  string account_id = 1;
+  int32 page_size = 2;
+  // Opaque, base64-encoded JSON `{event_at, article_id}` cursor. Empty →
+  // start from the beginning.
+  string page_token = 3;
+}
+
+message StreamAccountArticlesResponse {
+  repeated AccountStreamItem items = 1;
+  string next_page_token = 2;
+}

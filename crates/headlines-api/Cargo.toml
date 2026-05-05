@@ -1,0 +1,43 @@
+[package]
+name = "headlines-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+
+[dependencies]
+headlines-core.workspace = true
+headlines-proto.workspace = true
+headlines-auth.workspace = true
+headlines-store.workspace = true
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+url = "2"
+tracing.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+opentelemetry.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+serial_test.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
+sha2.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+diesel.workspace = true
+diesel-async.workspace = true
+tonic-types.workspace = true

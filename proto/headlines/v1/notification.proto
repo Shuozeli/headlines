@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+import "headlines/v1/options.proto";
+
+// NotificationService — see `docs/design/notifications.md` for the canonical
+// spec. Phase 7.9 reserves the proto + URLs + AUTH_TABLE entries; every RPC
+// returns `UNIMPLEMENTED` with `ErrorInfo.reason = "NOT_IMPLEMENTED_IN_V1"`.
+// No storage tables are added in v1.
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum NotificationKind {
+  NOTIFICATION_KIND_UNSPECIFIED = 0;
+  NOTIFICATION_KIND_NEW_ARTICLE = 1;
+  NOTIFICATION_KIND_NEW_FOLLOWER = 2;
+  NOTIFICATION_KIND_ARTICLE_TOMBSTONED = 3;
+  NOTIFICATION_KIND_ARTICLE_EDITED = 4;
+  NOTIFICATION_KIND_MENTION = 5;
+  NOTIFICATION_KIND_REPLY = 6;
+  NOTIFICATION_KIND_SYSTEM = 7;
+}
+
+enum NotificationChannel {
+  NOTIFICATION_CHANNEL_UNSPECIFIED = 0;
+  NOTIFICATION_CHANNEL_PUSH = 1;
+  NOTIFICATION_CHANNEL_EMAIL = 2;
+  NOTIFICATION_CHANNEL_SMS = 3;
+  NOTIFICATION_CHANNEL_IN_APP = 4;
+}
+
+enum NotificationStatus {
+  NOTIFICATION_STATUS_UNSPECIFIED = 0;
+  NOTIFICATION_STATUS_PENDING = 1;
+  NOTIFICATION_STATUS_DELIVERED = 2;
+  NOTIFICATION_STATUS_FAILED = 3;
+  NOTIFICATION_STATUS_READ = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+message NotificationPayload {
+  string title = 1;
+  string body = 2;
+  string image_url = 3;
+  map<string, string> data = 4;
+}
+
+message QuietHours {
+  bool enabled = 1;
+  string timezone = 2;
+  int32 start_hour = 3;
+  int32 end_hour = 4;
+}
+
+message Notification {
+  string id = 1;
+  string user_id = 2;
+  string article_id = 3;
+  NotificationKind kind = 4;
+  repeated NotificationChannel channels = 5;
+  NotificationPayload payload = 6;
+  NotificationStatus status = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp delivered_at = 9;
+  google.protobuf.Timestamp read_at = 10;
+}
+
+message NotificationPreferences {
+  string user_id = 1;
+  repeated NotificationChannel disabled_channels = 2;
+  repeated NotificationKind disabled_kinds = 3;
+  QuietHours quiet_hours = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Requests / Responses
+// ---------------------------------------------------------------------------
+
+message SendNotificationRequest {
+  string idempotency_key = 1;
+  string user_id = 2;
+  string article_id = 3;
+  NotificationKind kind = 4;
+  repeated NotificationChannel channels = 5;
+  NotificationPayload payload = 6;
+}
+
+message SendNotificationBatchRequest {
+  repeated SendNotificationRequest notifications = 1;
+}
+
+message SendNotificationBatchResponse {
+  repeated Notification recorded = 1;
+  int32 stored_count = 2;
+}
+
+message ListUserNotificationsRequest {
+  string user_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  bool unread_only = 4;
+}
+
+message ListUserNotificationsResponse {
+  repeated Notification items = 1;
+  string next_page_token = 2;
+}
+
+message MarkNotificationReadRequest {
+  string id = 1;
+}
+
+message MarkAllUserNotificationsReadRequest {
+  string user_id = 1;
+}
+
+message MarkAllUserNotificationsReadResponse {
+  int32 marked_count = 1;
+}
+
+message GetUserNotificationPreferencesRequest {
+  string user_id = 1;
+}
+
+message UpdateUserNotificationPreferencesRequest {
+  NotificationPreferences preferences = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// NotificationService — reserved-but-not-implemented in v1. Every RPC returns
+// `UNIMPLEMENTED` with `ErrorInfo.reason = "NOT_IMPLEMENTED_IN_V1"` per
+// `notifications.md` § "v1 behavior". A future "delivery" doc / phase will
+// pick this up. Authorization is encoded directly on each RPC via the
+// `auth_requirement` MethodOption; the proto-driven `AUTH_TABLE` enforces it
+// even though the handlers are stubs (so misconfigured callers see
+// `PERMISSION_DENIED` before hitting the 501).
+service NotificationService {
+  // SendNotification — system-only writer. Authorization: System with
+  // `notifications.send`.
+  rpc SendNotification(SendNotificationRequest) returns (Notification) {
+    option (google.api.http) = {
+      post: "/v1/notifications"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.send"]
+    };
+  }
+
+  // SendNotificationBatch — system-only writer. Authorization: System with
+  // `notifications.send`.
+  rpc SendNotificationBatch(SendNotificationBatchRequest)
+      returns (SendNotificationBatchResponse) {
+    option (google.api.http) = {
+      post: "/v1/notifications:batch"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.send"]
+    };
+  }
+
+  // ListUserNotifications — User self **or** System with `notifications.read`.
+  rpc ListUserNotifications(ListUserNotificationsRequest)
+      returns (ListUserNotificationsResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/notifications"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.read"]
+    };
+  }
+
+  // MarkNotificationRead — User self only (the recipient).
+  rpc MarkNotificationRead(MarkNotificationReadRequest) returns (Notification) {
+    option (google.api.http) = {
+      post: "/v1/notifications/{id}/read"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF]
+    };
+  }
+
+  // MarkAllUserNotificationsRead — User self **or** System with
+  // `notifications.admin`.
+  rpc MarkAllUserNotificationsRead(MarkAllUserNotificationsReadRequest)
+      returns (MarkAllUserNotificationsReadResponse) {
+    option (google.api.http) = {
+      post: "/v1/users/{user_id}/notifications:mark-all-read"
+      body: "*"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.admin"]
+    };
+  }
+
+  // GetUserNotificationPreferences — User self **or** System with
+  // `notifications.read`.
+  rpc GetUserNotificationPreferences(GetUserNotificationPreferencesRequest)
+      returns (NotificationPreferences) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/notification-preferences"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.read"]
+    };
+  }
+
+  // UpdateUserNotificationPreferences — User self **or** System with
+  // `notifications.admin`.
+  rpc UpdateUserNotificationPreferences(UpdateUserNotificationPreferencesRequest)
+      returns (NotificationPreferences) {
+    option (google.api.http) = {
+      patch: "/v1/users/{preferences.user_id}/notification-preferences"
+      body: "preferences"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["notifications.admin"]
+    };
+  }
+}

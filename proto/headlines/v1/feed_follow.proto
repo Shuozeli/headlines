@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package headlines.v1;
+
+import "google/api/annotations.proto";
+
+import "headlines/v1/common.proto";
+import "headlines/v1/options.proto";
+
+// FollowFeedItem carries an `ArticleSummary` per `feed-follow.md`. Distinct
+// from `FeedItem` (recommendation) — there is no `position` field; ordering is
+// data-driven by `article.created_at DESC` and is not server-assigned.
+message FollowFeedItem {
+  ArticleSummary article = 1;
+}
+
+// FeedFollowService — see `docs/design/feed-follow.md` for the canonical spec
+// (validation rules, error reasons, behavior, pagination semantics).
+// Authorization is encoded directly on the RPC via the `auth_requirement`
+// MethodOption and consumed by the proto-driven `AUTH_TABLE` (see
+// `docs/design/architecture.md` "Proto-driven authorization").
+//
+// The follow-derived feed is a read-only computed view: the JOIN
+// `follows ⨝ articles_live ⨝ article_versions` is evaluated at read time;
+// there is no write-side companion RPC. Tombstoned and missing articles are
+// excluded by the JOIN itself.
+service FeedFollowService {
+  // GetFollowFeed returns articles authored by accounts the user currently
+  // follows, ordered by `articles.created_at DESC` with keyset pagination on
+  // `(article.created_at, article.id)`. Articles from deleted accounts are
+  // included; redacted current versions surface with `redacted=true` on the
+  // summary. No "since I followed" cutoff — older articles surface too.
+  //
+  // Authorization: the User whose `id == request.user_id` OR a System with
+  // `feeds.follow.read`.
+  rpc GetFollowFeed(GetFollowFeedRequest) returns (GetFollowFeedResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/feed/follow"
+    };
+    option (headlines.v1.auth_requirement) = {
+      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      required_scopes: ["feeds.follow.read"]
+    };
+  }
+}
+
+message GetFollowFeedRequest {
+  string user_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message GetFollowFeedResponse {
+  repeated FollowFeedItem items = 1;
+  string next_page_token = 2;
+}
