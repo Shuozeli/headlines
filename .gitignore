@@ -21,4 +21,3 @@ config.local.toml
 # Keep the committed OpenAPI artifact for the REST gateway to serve.
 !/gen/openapi
 !/gen/openapi/**
-

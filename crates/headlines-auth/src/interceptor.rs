@@ -685,14 +685,7 @@ mod tests {
         let svc = CapturingService::default();
         let mut svc = layer.layer(svc);
 
-        let auth = build_authorization(
-            &sk,
-            kid,
-            "POST",
-            "/x",
-            "",
-            Tso::from_parts(50_000, 0),
-        );
+        let auth = build_authorization(&sk, kid, "POST", "/x", "", Tso::from_parts(50_000, 0));
 
         // Compressed-flag gRPC frame with zero payload.
         let mut framed = vec![1u8];

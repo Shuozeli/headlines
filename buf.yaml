@@ -1,11 +1,28 @@
 version: v2
 modules:
   - path: proto
-deps:
-  - buf.build/googleapis/googleapis
 lint:
   use:
-    - DEFAULT
+    - STANDARD
+  except:
+    # We intentionally return well-known / domain types directly from RPCs
+    # (e.g. `PublishDraft → Article`, `RecordEvent → Event`,
+    # `DeleteDraft → google.protobuf.Empty`). The default rules want a
+    # dedicated `*Response` wrapper for every RPC; that's a Google AIP
+    # convention we've explicitly opted out of in the design (see
+    # docs/design/api-conventions.md and per-service docs). Keeping the
+    # rest of STANDARD.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_RESPONSE_STANDARD_NAME
+  ignore:
+    # Vendored googleapis (annotations.proto, http.proto) — these still
+    # need to be resolvable for `import "google/api/annotations.proto"`,
+    # but we don't lint our naming/versioning rules against them.
+    - proto/google
+deps:
+  - buf.build/googleapis/googleapis
 breaking:
   use:
     - FILE
+  ignore:
+    - proto/google

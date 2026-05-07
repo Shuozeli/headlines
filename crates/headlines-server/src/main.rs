@@ -414,9 +414,7 @@ fn build_algorithm_registry(config: &Config) -> anyhow::Result<AlgorithmRegistry
                 reg = reg.with(Box::new(headlines_auth::Ed25519));
             }
             other => {
-                anyhow::bail!(
-                    "unknown signature algorithm in [auth.algorithms].enabled: {other}"
-                );
+                anyhow::bail!("unknown signature algorithm in [auth.algorithms].enabled: {other}");
             }
         }
     }

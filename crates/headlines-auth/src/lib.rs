@@ -27,7 +27,9 @@ pub mod time;
 
 pub use algo::{AlgorithmRegistry, Ed25519};
 pub use authorize::AuthorizationLayer;
-pub use interceptor::{AuthInterceptor, BodyHashError, BodyHasher, NoopBodyHasher, ProtoBodyHasher};
+pub use interceptor::{
+    AuthInterceptor, BodyHashError, BodyHasher, NoopBodyHasher, ProtoBodyHasher,
+};
 pub use metrics::{AuthMetrics, classify_auth_error};
 pub use nonce::InMemoryNonceStore;
 pub use postgres_resolver::PostgresKeyResolver;

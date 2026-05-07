@@ -128,11 +128,7 @@ impl KeyResolver for PostgresKeyResolver {
         let user_active: Option<(Uuid, String, String)> = user_keys::table
             .filter(user_keys::key_id.eq(key_id))
             .filter(user_keys::status.eq(ACTIVE_STATUS))
-            .select((
-                user_keys::user_id,
-                user_keys::algo,
-                user_keys::public_key,
-            ))
+            .select((user_keys::user_id, user_keys::algo, user_keys::public_key))
             .first::<(Uuid, String, String)>(&mut conn)
             .await
             .optional()
@@ -409,7 +405,11 @@ mod tests {
         .bind::<Text, _>(public_key_b64.to_owned())
         .bind::<Text, _>(status.to_owned())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            if status == "revoked" { Some(Utc::now()) } else { None },
+            if status == "revoked" {
+                Some(Utc::now())
+            } else {
+                None
+            },
         )
         .execute(conn)
         .await
@@ -641,7 +641,11 @@ mod tests {
         .bind::<Text, _>(public_key_b64.to_owned())
         .bind::<Text, _>(status.to_owned())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            if status == "revoked" { Some(Utc::now()) } else { None },
+            if status == "revoked" {
+                Some(Utc::now())
+            } else {
+                None
+            },
         )
         .execute(conn)
         .await
