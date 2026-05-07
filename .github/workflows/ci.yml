@@ -67,10 +67,19 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://cyuan:cyuan@localhost:5432/headlines
+      PGPASSWORD: cyuan
     steps:
       - uses: actions/checkout@v4
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and psql client
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
+      - name: Apply migrations to fresh Postgres
+        run: |
+          # Tests insert into the schema directly via raw SQL; the fresh
+          # service-container Postgres has no schema until we apply the
+          # migration. We use psql rather than diesel_cli to avoid the
+          # ~2-min `cargo install diesel_cli` step.
+          psql -h localhost -U cyuan -d headlines \
+               -f migrations/00000000000000_initial/up.sql
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
