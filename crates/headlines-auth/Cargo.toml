@@ -19,7 +19,7 @@ hyper.workspace = true
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-tokio = { workspace = true, features = ["full"] }
+tokio.workspace = true
 async-trait.workspace = true
 
 # --- Crypto ---

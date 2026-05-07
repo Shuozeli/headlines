@@ -4,5 +4,26 @@ inputs:
 plugins:
   - remote: buf.build/grpc-ecosystem/openapiv2
     out: gen/openapi
+    # Generate a single combined Swagger 2.0 file plus inject Go-style
+    # package mappings (the openapiv2 plugin reuses protoc-gen-go's
+    # path resolver and refuses to run without them, even though the
+    # output never references Go packages).
     opt:
       - logtostderr=true
+      # Merge all .proto files into a single Swagger 2.0 file. The plugin
+      # emits `gen/openapi/headlines.swagger.json` (basename derived from
+      # the proto package's leading segment); the REST gateway includes
+      # this file directly via `include_str!`.
+      - allow_merge=true
+      - Mheadlines/v1/account.proto=headlines.v1
+      - Mheadlines/v1/account_stream.proto=headlines.v1
+      - Mheadlines/v1/article.proto=headlines.v1
+      - Mheadlines/v1/common.proto=headlines.v1
+      - Mheadlines/v1/draft.proto=headlines.v1
+      - Mheadlines/v1/event.proto=headlines.v1
+      - Mheadlines/v1/feed_follow.proto=headlines.v1
+      - Mheadlines/v1/feed_recommendation.proto=headlines.v1
+      - Mheadlines/v1/follow.proto=headlines.v1
+      - Mheadlines/v1/notification.proto=headlines.v1
+      - Mheadlines/v1/options.proto=headlines.v1
+      - Mheadlines/v1/user.proto=headlines.v1

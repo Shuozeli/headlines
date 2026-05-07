@@ -108,9 +108,9 @@ Drafts are always required to be valid articles in our system. The same rules fr
 
 | Field | Rule |
 |---|---|
-| `title` | 1–256 chars, trimmed (non-empty) |
-| `author_name` | empty or ≤128 chars |
-| `author_url` | empty or valid `http(s)://` URL, ≤512 chars |
+| `title` | 1–256 **chars** (Unicode), trimmed (non-empty) |
+| `author_name` | empty or ≤128 **chars** (Unicode) |
+| `author_url` | empty or valid `http(s)://` URL, ≤512 **bytes** (URL is opaque) |
 | `content` | non-empty; serialized size ≤ `articles.content_max_bytes` (default 20 MiB) |
 | Node `tag` | from the Telegraph allow-list (see `articles.md`) |
 | Node `attrs` | per-tag allow-list (see `articles.md`) |

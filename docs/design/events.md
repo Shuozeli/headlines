@@ -177,6 +177,8 @@ The `properties` oneof selector must match `type` (e.g. `type = OPEN` ⇒ `prope
 
 All `ListEventsRequest` filters are AND-combined. Filterable: `user_id`, `article_id`, any subset of `types`, `received_at` bounds. Cursor encodes `(received_at, id)` for stable forward iteration; results in ASC order so the ranker can drain incrementally.
 
+`types` filter: `EVENT_TYPE_UNSPECIFIED` in the list is rejected with `INVALID_ARGUMENT` (same rule as the write-side `type` validation). Clients constructing the filter dynamically must omit unspecified entries client-side; silently dropping the marker would mask a client-side enum-encoding bug.
+
 ## Validation
 
 | Field | Rule |

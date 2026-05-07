@@ -80,10 +80,11 @@ const AUTHOR_URL_MAX: usize = 512;
 
 fn validate_short_name(raw: &str) -> Result<String, HeadlinesError> {
     let trimmed = raw.trim().to_owned();
-    if trimmed.len() < SHORT_NAME_MIN || trimmed.len() > SHORT_NAME_MAX {
+    let char_count = trimmed.chars().count();
+    if !(SHORT_NAME_MIN..=SHORT_NAME_MAX).contains(&char_count) {
         return Err(HeadlinesError::InvalidArgument {
             field: "short_name".into(),
-            reason: format!("length must be {SHORT_NAME_MIN}..={SHORT_NAME_MAX}"),
+            reason: format!("length must be {SHORT_NAME_MIN}..={SHORT_NAME_MAX} characters"),
         });
     }
     if !trimmed
@@ -100,10 +101,11 @@ fn validate_short_name(raw: &str) -> Result<String, HeadlinesError> {
 
 fn validate_author_name(raw: &str) -> Result<String, HeadlinesError> {
     let trimmed = raw.trim().to_owned();
-    if trimmed.len() < AUTHOR_NAME_MIN || trimmed.len() > AUTHOR_NAME_MAX {
+    let char_count = trimmed.chars().count();
+    if !(AUTHOR_NAME_MIN..=AUTHOR_NAME_MAX).contains(&char_count) {
         return Err(HeadlinesError::InvalidArgument {
             field: "author_name".into(),
-            reason: format!("length must be {AUTHOR_NAME_MIN}..={AUTHOR_NAME_MAX}"),
+            reason: format!("length must be {AUTHOR_NAME_MIN}..={AUTHOR_NAME_MAX} characters"),
         });
     }
     Ok(trimmed)
@@ -560,5 +562,33 @@ mod tests {
 
         // Assert
         assert!(matches!(res, Err(HeadlinesError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn validate_short_name_counts_chars_not_bytes() {
+        // Arrange — `short_name` is constrained to ASCII-only via the charset
+        // allow-list, but the *length* check must count chars, not bytes, so
+        // boundary semantics are consistent with other human-display fields.
+        // 32 ASCII chars = 32 chars and 32 bytes; must be allowed.
+        let s: String = "a".repeat(32);
+
+        // Act
+        let res = validate_short_name(&s);
+
+        // Assert
+        assert_eq!(res.unwrap().chars().count(), 32);
+    }
+
+    #[test]
+    fn validate_author_name_counts_chars_not_bytes() {
+        // Arrange — 128 fox emoji = 128 chars but ~512 bytes; must be allowed
+        // because `author_name` is a human-display field measured in chars.
+        let s: String = "🦊".repeat(128);
+
+        // Act
+        let res = validate_author_name(&s);
+
+        // Assert
+        assert_eq!(res.unwrap().chars().count(), 128);
     }
 }

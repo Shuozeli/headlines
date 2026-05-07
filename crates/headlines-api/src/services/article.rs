@@ -140,20 +140,21 @@ fn parse_uuid(field: &str, raw: &str) -> Result<Uuid, HeadlinesError> {
 
 pub(crate) fn validate_title(raw: &str) -> Result<String, HeadlinesError> {
     let trimmed = raw.trim().to_owned();
-    if trimmed.len() < TITLE_MIN || trimmed.len() > TITLE_MAX {
+    let char_count = trimmed.chars().count();
+    if !(TITLE_MIN..=TITLE_MAX).contains(&char_count) {
         return Err(HeadlinesError::InvalidArgument {
             field: "title".into(),
-            reason: format!("length must be {TITLE_MIN}..={TITLE_MAX}"),
+            reason: format!("length must be {TITLE_MIN}..={TITLE_MAX} characters"),
         });
     }
     Ok(trimmed)
 }
 
 pub(crate) fn validate_author_name(raw: &str) -> Result<String, HeadlinesError> {
-    if raw.len() > AUTHOR_NAME_MAX {
+    if raw.chars().count() > AUTHOR_NAME_MAX {
         return Err(HeadlinesError::InvalidArgument {
             field: "author_name".into(),
-            reason: format!("length must be <= {AUTHOR_NAME_MAX}"),
+            reason: format!("length must be <= {AUTHOR_NAME_MAX} characters"),
         });
     }
     Ok(raw.to_owned())
@@ -680,6 +681,32 @@ mod tests {
 
         // Assert
         assert!(matches!(res, Err(HeadlinesError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn validate_title_counts_chars_not_bytes() {
+        // Arrange — 256 fox emoji = 256 chars but ~1024 bytes; must be allowed
+        // because `title` is a human-display field measured in chars.
+        let s: String = "🦊".repeat(256);
+
+        // Act
+        let res = validate_title(&s);
+
+        // Assert
+        assert_eq!(res.unwrap().chars().count(), 256);
+    }
+
+    #[test]
+    fn validate_author_name_counts_chars_not_bytes() {
+        // Arrange — 128 fox emoji = 128 chars but ~512 bytes; must be allowed
+        // because `author_name` is a human-display field measured in chars.
+        let s: String = "🦊".repeat(128);
+
+        // Act
+        let res = validate_author_name(&s);
+
+        // Assert
+        assert_eq!(res.unwrap().chars().count(), 128);
     }
 
     #[test]

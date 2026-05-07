@@ -196,6 +196,8 @@ Version history is **not exposed** in v1. No `GetArticleVersion` / `ListArticleV
 
 `include_tombstoned=true` on `ListAccountArticles` is allowed for any subject; tombstones are public reads.
 
+Cross-account `EditArticle` / `TombstoneArticle` returns `PERMISSION_DENIED` (not `NOT_FOUND`) because article existence is already public via anonymous `GetArticle`. Privacy-style `NOT_FOUND` carve-outs are reserved for resources whose existence is non-public (see `users.md`).
+
 ## Identity
 
 - `article.id`: UUIDv7. Server-generated.
@@ -205,15 +207,15 @@ Version history is **not exposed** in v1. No `GetArticleVersion` / `ListArticleV
 
 | Field | Rule |
 |---|---|
-| `title` | 1–256 chars, trimmed |
-| `author_name` | empty or ≤128 chars |
-| `author_url` | empty or valid `http(s)://` URL, ≤512 chars |
+| `title` | 1–256 **chars** (Unicode), trimmed |
+| `author_name` | empty or ≤128 **chars** (Unicode) |
+| `author_url` | empty or valid `http(s)://` URL, ≤512 **bytes** (URL is opaque) |
 | `content` | non-empty; serialized size ≤ `articles.content_max_bytes` (default **20 MB**, configurable) |
 | Node `tag` | allow-list: `p`, `h3`, `h4`, `a`, `img`, `figure`, `figcaption`, `blockquote`, `aside`, `pre`, `code`, `em`, `strong`, `s`, `u`, `iframe`, `video`, `br`, `hr`, `ul`, `ol`, `li` |
 | Node `attrs` | per-tag allow-list: `a` → `href`; `img`, `iframe`, `video` → `src`; `img` → `alt` (others rejected with `INVALID_NODE_ATTR`) |
 | `update_mask` paths | only `title`, `author_name`, `author_url`, `content` |
-| `redaction_reason` | 1–512 chars |
-| `tombstone reason` | empty or ≤512 chars |
+| `redaction_reason` | 1–512 **bytes** (operator/system note, not user-facing) |
+| `tombstone reason` | empty or ≤512 **bytes** (operator/system note, not user-facing) |
 
 Configuration block (deployment-level):
 

@@ -208,6 +208,26 @@ Scope semantics (recurring pattern across resources):
 
 Per-article visibility flag (private/public switch) is deferred. v1: all live articles publicly readable.
 
+### Layer-vs-code mapping
+
+`AuthInterceptor` returns `UNAUTHENTICATED` only when a *presented credential fails* (malformed `Authorization` header, bad signature, expired `ts`, replayed `nonce`, body-hash mismatch, etc.). A request with no `Authorization` header at all resolves to `Subject::Anonymous` — never `UNAUTHENTICATED`.
+
+`AuthorizationLayer` then consults the proto-derived `AUTH_TABLE`. If `Anonymous` is not in the RPC's `allowed` subject classes, the layer returns `PERMISSION_DENIED`.
+
+Tests asserting the anonymous-rejection surface should pin `PERMISSION_DENIED` (the `AuthorizationLayer` outcome). `UNAUTHENTICATED` is reserved for credential failures and should be asserted with a specifically malformed header.
+
+### Cross-table `key_id` collision
+
+`PostgresKeyResolver` scans all three key tables (`account_keys`, `user_keys`, `system_keys`) for the requested `key_id` and applies exactly-one-active semantics:
+
+- 0 active matches → `NotFound` (or `Revoked` if a non-active row exists).
+- 1 active match → authenticates as that subject class.
+- 2+ active matches → **fatal integrity error**: returns `ResolveError::Internal` (mapped to `UNAUTHENTICATED` on the wire) and emits a `tracing::error!` with the colliding tables.
+
+UUIDv7 collisions are astronomically unlikely; a real collision indicates a bug or a deliberate cross-write.
+
+**Operator runbook.** The `error!` log identifies the colliding tables; pick one row to keep, revoke or delete the other, and rotate keys for the affected subject(s).
+
 ## Out of scope
 
 - Authorization rules per endpoint → each component doc.

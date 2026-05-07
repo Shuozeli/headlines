@@ -18,7 +18,7 @@ publish = false
 
 [workspace.dependencies]
 # --- Async / gRPC / HTTP ---
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tonic = "0.12"
 tonic-build = "0.12"
 tonic-types = "0.12"

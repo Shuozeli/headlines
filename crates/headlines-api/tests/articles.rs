@@ -1256,6 +1256,55 @@ async fn tombstone_article_already_tombstoned_returns_article_tombstoned() {
 }
 
 #[tokio::test]
+async fn edit_article_by_non_owner_account_is_permission_denied() {
+    skip_if_no_db!();
+
+    // Arrange — A publishes, B tries to edit. Existence of the article is
+    // already public via anonymous GetArticle, so a privacy-style NOT_FOUND
+    // carve-out doesn't help here — PERMISSION_DENIED is the correct surface.
+    let mut h = spawn_server().await;
+    let sk_a = make_signing_key();
+    let (acct_a, key_a) = seed_account_with_key(&h.db, &sk_a).await;
+    let sk_b = make_signing_key();
+    let (acct_b, key_b) = seed_account_with_key(&h.db, &sk_b).await;
+    let article_id = publish_one(&mut h, &sk_a, acct_a, key_a, "A's").await;
+
+    let edit = EditArticleRequest {
+        id: article_id.to_string(),
+        edit: Some(ArticleEdit {
+            title: "B's takeover".into(),
+            author_name: String::new(),
+            author_url: String::new(),
+            content: vec![],
+        }),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".into()],
+        }),
+    };
+    let ts = h.clock.now().await.unwrap();
+    let signed_req = signed(
+        edit,
+        &sk_b,
+        key_b,
+        "/headlines.v1.ArticleService/EditArticle",
+        ts,
+        &unique_nonce(),
+    );
+
+    // Act
+    let err = h
+        .client
+        .edit_article(signed_req)
+        .await
+        .expect_err("non-owner edit");
+
+    // Assert
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    cleanup_articles(&h.db, &[acct_a, acct_b]).await;
+}
+
+#[tokio::test]
 async fn tombstone_article_by_non_owner_account_is_permission_denied() {
     skip_if_no_db!();
 

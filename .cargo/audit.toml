@@ -1,0 +1,17 @@
+# cargo-audit configuration.
+#
+# `cargo audit` is run strict in CI (no `continue-on-error`). The advisory
+# database is fetched fresh each run. Each entry under `[advisories].ignore`
+# MUST include a justification comment + expiry date. Reviewed by maintainer
+# in PR. Audit advisories at https://rustsec.org/advisories/.
+#
+# Severity gating:
+# - `vulnerability` advisories ALWAYS fail the run.
+# - `unsound` and `unmaintained` informational warnings are surfaced but
+#   do not fail the run by default (cargo-audit treats them as warnings).
+#   If we want to gate on them, set `informational_warnings = ["unsound",
+#   "unmaintained"]` and add justified ignores below.
+
+[advisories]
+ignore = []
+informational_warnings = []

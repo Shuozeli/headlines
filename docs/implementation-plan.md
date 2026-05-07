@@ -144,7 +144,7 @@ Per sub-phase deliverables: proto file with `auth_requirement` annotations, migr
 - [x] OpenAPI/Swagger generation via `protoc-gen-openapiv2`; served at `/openapi.json` by the REST gateway (hand-rolled placeholder pending `buf generate`; see `docs/implementation-issues.md` `[8]`)
 - [x] OpenTelemetry metrics: `rpc_calls_total`, `rpc_latency_seconds`, `auth_results_total`, domain counters
 - [x] CI schema-drift check: applying migrations matches `crates/headlines-store/src/schema.rs`
-- [x] CI dependency audit (`cargo audit`, allow-fail in v1)
+- [x] CI dependency audit (`cargo audit`). Strict; advisories ignored via `.cargo/audit.toml` with justification.
 - [x] `docs/codelabs.md` walk-through for one full publishing flow (account → draft → publish → feed → user reads → tombstone)
 - [x] README updates: real build/run, deployment notes
 - [x] Smoke deploy on Tailscale; documented in README under "Deployment"

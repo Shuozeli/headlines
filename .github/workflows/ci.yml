@@ -149,12 +149,25 @@ jobs:
             && echo "table sets match between db/schema.sql and pg_dump output" \
             || echo "::warning::table-name set differs between db/schema.sql and pg_dump output"
 
+  openapi-drift:
+    name: openapi drift (buf generate vs committed swagger.json)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Regenerate OpenAPI spec
+        run: buf generate
+      - name: Diff committed OpenAPI against `buf generate` output
+        run: |
+          git diff --exit-code gen/openapi/ \
+            || (echo "::error::OpenAPI drift detected — run 'buf generate' and commit gen/openapi/" && exit 1)
+
   cargo-audit:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest
-    # Allow-fail for v1: security advisories are useful signal but should
-    # not block merges in v1. Tighten in v1.1.
-    continue-on-error: true
+    # Strict: any advisory not explicitly ignored in .cargo/audit.toml
+    # fails the run. Each ignore entry must carry a justification comment
+    # and an expiry date.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -163,4 +176,5 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
+        # cargo-audit picks up .cargo/audit.toml automatically.
         run: cargo audit

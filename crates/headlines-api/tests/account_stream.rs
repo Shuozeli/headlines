@@ -611,7 +611,12 @@ async fn account_self_call_is_rejected() {
 async fn anonymous_call_is_rejected() {
     skip_if_no_db!();
 
-    // Arrange — no Authorization header at all.
+    // Arrange — no Authorization header at all. The interceptor resolves the
+    // request to `Subject::Anonymous` (no credential presented), and the
+    // AuthorizationLayer rejects with PERMISSION_DENIED because Anonymous is
+    // not in this RPC's `allowed` subject classes. UNAUTHENTICATED is reserved
+    // for failed credentials (see `docs/design/auth.md` "Layer-vs-code
+    // mapping").
     let mut h = spawn_server().await;
     let account_id = seed_account(&h.db).await;
 
@@ -628,14 +633,42 @@ async fn anonymous_call_is_rejected() {
         .await
         .expect_err("anonymous stream must reject");
 
-    // Assert — Anonymous fails the proto-level allowed_subjects gate.
-    // (The interceptor surfaces unauth as Unauthenticated; the proto layer
-    // surfaces permission-denied for an Anonymous subject.) Either is acceptable
-    // — both close the door.
-    assert!(matches!(
-        err.code(),
-        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
-    ));
+    // Assert — pin PERMISSION_DENIED exactly (the AuthorizationLayer's
+    // outcome for Anonymous).
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    cleanup(&h.db, &[], &[account_id], &[]).await;
+}
+
+#[tokio::test]
+async fn malformed_authorization_returns_unauthenticated() {
+    skip_if_no_db!();
+
+    // Arrange — a non-empty but unparseable Authorization header. The
+    // interceptor recognizes a presented credential (Authorization header
+    // exists) and fails to parse it → UNAUTHENTICATED, *not*
+    // PERMISSION_DENIED. This pins the layer-vs-code mapping in
+    // `docs/design/auth.md`.
+    let mut h = spawn_server().await;
+    let account_id = seed_account(&h.db).await;
+
+    let mut req = tonic::Request::new(StreamAccountArticlesRequest {
+        account_id: account_id.to_string(),
+        page_size: 50,
+        page_token: String::new(),
+    });
+    req.metadata_mut()
+        .insert("authorization", "Bearer not-our-format".parse().unwrap());
+
+    // Act
+    let err = h
+        .client
+        .stream_account_articles(req)
+        .await
+        .expect_err("malformed Authorization header must reject");
+
+    // Assert — failed credential → UNAUTHENTICATED (not PERMISSION_DENIED).
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
     cleanup(&h.db, &[], &[account_id], &[]).await;
 }

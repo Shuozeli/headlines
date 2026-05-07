@@ -1,0 +1,3093 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "google/api/http.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "AccountService"
+    },
+    {
+      "name": "AccountStreamService"
+    },
+    {
+      "name": "ArticleService"
+    },
+    {
+      "name": "DraftService"
+    },
+    {
+      "name": "EventService"
+    },
+    {
+      "name": "FeedFollowService"
+    },
+    {
+      "name": "FeedRecommendationService"
+    },
+    {
+      "name": "FollowService"
+    },
+    {
+      "name": "NotificationService"
+    },
+    {
+      "name": "UserService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/accounts": {
+      "post": {
+        "summary": "CreateAccount mints a new account + initial key.",
+        "description": "Authorization: in `open` bootstrap mode, anonymous callers may\nself-register. In `system_only` mode, only systems with `accounts.write`\nmay create accounts on a user's behalf. The proto allows BOTH; the\nservice handler rejects anonymous calls when bootstrap mode is\n`system_only` with `REGISTRATION_DISABLED` (PERMISSION_DENIED).",
+        "operationId": "AccountService_CreateAccount",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CreateAccountResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1CreateAccountRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      }
+    },
+    "/v1/accounts/{account.id}": {
+      "patch": {
+        "summary": "UpdateAccount applies a field-masked update.",
+        "description": "Authorization: ACCOUNT-owns-resource (account self) OR System with\n`accounts.admin`. Cross-account writes are rejected by the handler.",
+        "operationId": "AccountService_UpdateAccount",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Account"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "account.id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "account",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "shortName": {
+                  "type": "string"
+                },
+                "authorName": {
+                  "type": "string"
+                },
+                "authorUrl": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/definitions/v1AccountStatus"
+                },
+                "deletedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "createdAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "updatedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "description": "Account is the publisher identity row. `id` is a UUIDv7."
+            }
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/article-stream": {
+      "get": {
+        "summary": "StreamAccountArticles returns the per-account watermark feed in ASC\norder. Each event corresponds to a publish, edit, current-version\nredaction (which bumps `articles_live.updated_at`), or tombstone.\nDrafts never appear. Ordering is `(event_at, article_id) ASC`.",
+        "description": "The stream **closes** on account deletion: the RPC surfaces\n`ACCOUNT_DELETED` and republishers MUST remove all content from that\naccount on their target platform.\n\nAuthorization: System with `articles.stream`.",
+        "operationId": "AccountStreamService_StreamAccountArticles",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1StreamAccountArticlesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "description": "Opaque, base64-encoded JSON `{event_at, article_id}` cursor. Empty →\nstart from the beginning.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AccountStreamService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/articles": {
+      "get": {
+        "summary": "ListAccountArticles lists an account's articles in `created_at DESC`\norder. Anonymous-readable.",
+        "operationId": "ArticleService_ListAccountArticles",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListAccountArticlesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "includeTombstoned",
+            "description": "default false",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      },
+      "post": {
+        "summary": "PublishArticle creates a new live article in one shot.",
+        "description": "Authorization: the Account whose id == request.account_id (so the\nACCOUNT_OWNS_RESOURCE class) OR a System with `articles.write`.",
+        "operationId": "ArticleService_PublishArticle",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Article"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ArticleServicePublishArticleBody"
+            }
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/drafts": {
+      "get": {
+        "summary": "ListAccountDrafts lists an account's drafts, ordered by\n`updated_at DESC`.",
+        "description": "Authorization: the Account whose id == request.account_id OR a\nSystem with `drafts.read`.",
+        "operationId": "DraftService_ListAccountDrafts",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListAccountDraftsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      },
+      "post": {
+        "summary": "CreateDraft mints a new draft for the given account.",
+        "description": "Authorization: the Account whose id == request.account_id (so the\nACCOUNT_OWNS_RESOURCE class) OR a System with `drafts.write`.",
+        "operationId": "DraftService_CreateDraft",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Draft"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DraftServiceCreateDraftBody"
+            }
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/followers": {
+      "get": {
+        "summary": "ListAccountFollowers returns the followers of an account, ordered by\n`created_at DESC`. `include_unfollowed=false` (default) hides\n`unfollowed` rows. No filtering for deleted users — see `follows.md`.",
+        "description": "Authorization: the Account whose `id == request.account_id` OR a\nSystem with `follows.read`.",
+        "operationId": "FollowService_ListAccountFollowers",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListAccountFollowersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "includeUnfollowed",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "FollowService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/keys": {
+      "post": {
+        "summary": "AddAccountKey registers an additional active key on an account.",
+        "description": "Authorization: account self OR System with `accounts.admin`.",
+        "operationId": "AccountService_AddAccountKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1AccountKey"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AccountServiceAddAccountKeyBody"
+            }
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      }
+    },
+    "/v1/accounts/{accountId}/keys/{keyId}/revoke": {
+      "post": {
+        "summary": "RevokeAccountKey marks an existing key as revoked.",
+        "description": "Authorization: account self OR System with `accounts.admin`.\nLockout protection: the handler refuses to revoke the last active key\nunless the caller is a System with `admin.*` scope (operator rescue).",
+        "operationId": "AccountService_RevokeAccountKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1AccountKey"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "keyId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AccountServiceRevokeAccountKeyBody"
+            }
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      }
+    },
+    "/v1/accounts/{id}": {
+      "get": {
+        "summary": "GetAccount returns the full account row, including soft-deleted rows\n(status=DELETED, 200 — never NOT_FOUND). Anonymous-readable per `auth.md`.",
+        "operationId": "AccountService_GetAccount",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Account"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      },
+      "delete": {
+        "summary": "DeleteAccount soft-deletes the account.",
+        "description": "Authorization: ACCOUNT_SELF (self-delete) OR System with\n`accounts.delete`.",
+        "operationId": "AccountService_DeleteAccount",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Account"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "AccountService"
+        ]
+      }
+    },
+    "/v1/articles/{articleId}/versions/{version}/redact": {
+      "post": {
+        "summary": "RedactArticleVersion is the compliance-redaction RPC. System-only;\noperators with `articles.redact` perform the call. No account\nself-redaction in v1.",
+        "operationId": "ArticleService_RedactArticleVersion",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "articleId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ArticleServiceRedactArticleVersionBody"
+            }
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      }
+    },
+    "/v1/articles/{id}": {
+      "get": {
+        "summary": "GetArticle returns the full article, including content nodes if live\nand the current version is not redacted. Tombstoned articles return\n200 with `state=ARTICLE_STATE_TOMBSTONE`. Anonymous-readable.",
+        "operationId": "ArticleService_GetArticle",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Article"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      },
+      "patch": {
+        "summary": "EditArticle applies a field-masked edit, creating a new\narticle_versions row and bumping `articles_live.current_version`.",
+        "description": "Authorization: the Account who owns the article OR System with\n`articles.write`.",
+        "operationId": "ArticleService_EditArticle",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Article"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ArticleServiceEditArticleBody"
+            }
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      }
+    },
+    "/v1/articles/{id}/tombstone": {
+      "post": {
+        "summary": "TombstoneArticle is a one-way state transition (no untombstone).",
+        "description": "Authorization: the Account who owns the article OR System with\n`articles.tombstone`.",
+        "operationId": "ArticleService_TombstoneArticle",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Article"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ArticleServiceTombstoneArticleBody"
+            }
+          }
+        ],
+        "tags": [
+          "ArticleService"
+        ]
+      }
+    },
+    "/v1/drafts/{draft.id}": {
+      "patch": {
+        "summary": "UpdateDraft applies a field-masked update to an existing draft. The\nresulting record is re-validated strictly per `drafts.md`.",
+        "description": "Authorization: the Account who owns the draft OR a System with\n`drafts.write`.",
+        "operationId": "DraftService_UpdateDraft",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Draft"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "draft.id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DraftServiceUpdateDraftBody"
+            }
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      }
+    },
+    "/v1/drafts/{id}": {
+      "get": {
+        "summary": "GetDraft returns the full draft. Drafts are private working space; a\ncaller who does not own the draft (or a System with `drafts.read`)\nreceives `DRAFT_NOT_FOUND` rather than `PERMISSION_DENIED` — no\nexistence leak.",
+        "operationId": "DraftService_GetDraft",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Draft"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      },
+      "delete": {
+        "summary": "DeleteDraft hard-deletes a draft (no tombstone — drafts were never\npublic).",
+        "description": "Authorization: the Account who owns the draft OR a System with\n`drafts.write`.",
+        "operationId": "DraftService_DeleteDraft",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      }
+    },
+    "/v1/drafts/{id}/publish": {
+      "post": {
+        "summary": "PublishDraft converts the draft to a live Article in a single\ntransaction, preserving the UUID.",
+        "description": "Authorization: the Account who owns the draft OR a System with\n`articles.write` (this RPC produces an Article).",
+        "operationId": "DraftService_PublishDraft",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Article"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DraftServicePublishDraftBody"
+            }
+          }
+        ],
+        "tags": [
+          "DraftService"
+        ]
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "summary": "ListEvents — analytics-only. Filters AND-combined; cursor encodes\n`(received_at, id)` for stable forward iteration; results in ASC order\nso the ranker can drain incrementally.",
+        "description": "Authorization: System with `events.read` only.",
+        "operationId": "EventService_ListEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListEventsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "description": "Opaque base64 cursor on `(received_at, id)` ASC.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "userId",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "articleId",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "required": false,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "EVENT_TYPE_UNSPECIFIED",
+                "EVENT_TYPE_IMPRESSION",
+                "EVENT_TYPE_OPEN",
+                "EVENT_TYPE_DWELL",
+                "EVENT_TYPE_LIKE",
+                "EVENT_TYPE_UNLIKE",
+                "EVENT_TYPE_SHARE"
+              ]
+            },
+            "collectionFormat": "multi"
+          },
+          {
+            "name": "receivedAfter",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "receivedBefore",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          }
+        ],
+        "tags": [
+          "EventService"
+        ]
+      },
+      "post": {
+        "summary": "RecordEvent appends a single event row. Server assigns `id` (UUIDv7) and\n`received_at` (TSO); any client-supplied values for those fields are\nsilently ignored.",
+        "description": "Authorization: User whose `id == request.user_id` OR System with\n`events.write`.",
+        "operationId": "EventService_RecordEvent",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Event"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1RecordEventRequest"
+            }
+          }
+        ],
+        "tags": [
+          "EventService"
+        ]
+      }
+    },
+    "/v1/events:batch": {
+      "post": {
+        "summary": "RecordEventBatch — all-or-none batch insert. Validation runs over the\nwhole batch first; on any failure the entire batch is rejected with the\nfirst failing reason. On success the batch is inserted in a single tx.\nCap is `events.batch_max_items` (default 500).",
+        "description": "Authorization: same rule as `RecordEvent`, applied to **every** event in\nthe batch.",
+        "operationId": "EventService_RecordEventBatch",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1RecordEventBatchResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1RecordEventBatchRequest"
+            }
+          }
+        ],
+        "tags": [
+          "EventService"
+        ]
+      }
+    },
+    "/v1/notifications": {
+      "post": {
+        "summary": "SendNotification — system-only writer. Authorization: System with\n`notifications.send`.",
+        "operationId": "NotificationService_SendNotification",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Notification"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1SendNotificationRequest"
+            }
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/notifications/{id}/read": {
+      "post": {
+        "summary": "MarkNotificationRead — User self only (the recipient).",
+        "operationId": "NotificationService_MarkNotificationRead",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Notification"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/NotificationServiceMarkNotificationReadBody"
+            }
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/notifications:batch": {
+      "post": {
+        "summary": "SendNotificationBatch — system-only writer. Authorization: System with\n`notifications.send`.",
+        "operationId": "NotificationService_SendNotificationBatch",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1SendNotificationBatchResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1SendNotificationBatchRequest"
+            }
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/users": {
+      "post": {
+        "summary": "CreateUser mints a new user + initial key.",
+        "description": "Authorization: in `open` bootstrap mode, anonymous callers may\nself-register. In `system_only` mode, only systems with `users.write`\nmay create users on a user's behalf. The proto allows BOTH; the\nservice handler rejects anonymous calls when bootstrap mode is\n`system_only` with `REGISTRATION_DISABLED` (PERMISSION_DENIED).",
+        "operationId": "UserService_CreateUser",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CreateUserResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1CreateUserRequest"
+            }
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      }
+    },
+    "/v1/users/{id}": {
+      "get": {
+        "summary": "GetUser returns the user row, including soft-deleted rows\n(status=DELETED, 200 — never NOT_FOUND for self/system).",
+        "description": "Privacy: GetUser is NOT anonymous. Unauthorized callers receive\n`USER_NOT_FOUND` (NOT_FOUND) — not PERMISSION_DENIED — so the API\ndoes not leak user existence.",
+        "operationId": "UserService_GetUser",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1User"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      },
+      "delete": {
+        "summary": "DeleteUser soft-deletes the user.",
+        "description": "Authorization: USER_SELF (self-delete) OR System with `users.delete`.",
+        "operationId": "UserService_DeleteUser",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1User"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      }
+    },
+    "/v1/users/{preferences.userId}/notification-preferences": {
+      "patch": {
+        "summary": "UpdateUserNotificationPreferences — User self **or** System with\n`notifications.admin`.",
+        "operationId": "NotificationService_UpdateUserNotificationPreferences",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1NotificationPreferences"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "preferences.userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "preferences",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "disabledChannels": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/v1NotificationChannel"
+                  }
+                },
+                "disabledKinds": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/v1NotificationKind"
+                  }
+                },
+                "quietHours": {
+                  "$ref": "#/definitions/v1QuietHours"
+                },
+                "updatedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/users/{user.id}": {
+      "patch": {
+        "summary": "UpdateUser applies a field-masked update.",
+        "description": "Authorization: USER_SELF OR System with `users.admin`. Cross-user\nwrites are rejected by the handler with `USER_NOT_FOUND`.",
+        "operationId": "UserService_UpdateUser",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1User"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "user.id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "user",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "displayName": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/definitions/v1UserStatus"
+                },
+                "deletedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "createdAt": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "description": "User is the consumer identity row. `id` is a UUIDv7."
+            }
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/feed/follow": {
+      "get": {
+        "summary": "GetFollowFeed returns articles authored by accounts the user currently\nfollows, ordered by `articles.created_at DESC` with keyset pagination on\n`(article.created_at, article.id)`. Articles from deleted accounts are\nincluded; redacted current versions surface with `redacted=true` on the\nsummary. No \"since I followed\" cutoff — older articles surface too.",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`feeds.follow.read`.",
+        "operationId": "FeedFollowService_GetFollowFeed",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetFollowFeedResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "FeedFollowService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/feed/recommendation": {
+      "get": {
+        "summary": "GetRecommendationFeed returns the joined feed view for the user. The\njoin against `articles_live` automatically excludes tombstoned and\nmissing articles (see `feed-recommendation.md` for details).",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`feeds.recommendation.read`.",
+        "operationId": "FeedRecommendationService_GetRecommendationFeed",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetRecommendationFeedResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "FeedRecommendationService"
+        ]
+      },
+      "put": {
+        "summary": "ReplaceRecommendationFeed atomically deletes the existing feed for the\nuser and inserts the supplied ordered list (position = index). System-only\nby design — the ranker is the only writer.",
+        "description": "Authorization: System with `feeds.recommendation.write`.",
+        "operationId": "FeedRecommendationService_ReplaceRecommendationFeed",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ReplaceRecommendationFeedResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/FeedRecommendationServiceReplaceRecommendationFeedBody"
+            }
+          }
+        ],
+        "tags": [
+          "FeedRecommendationService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/follows": {
+      "get": {
+        "summary": "ListUserFollows returns the follows owned by a user, ordered by\n`created_at DESC`. `include_unfollowed=false` (default) hides\n`unfollowed` rows.",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`follows.read`.",
+        "operationId": "FollowService_ListUserFollows",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListUserFollowsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "includeUnfollowed",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "FollowService"
+        ]
+      },
+      "post": {
+        "summary": "Follow creates or re-activates a `(user_id, account_id)` edge per\n`follows.md` state machine. Idempotent in the active direction; a\npreviously `unfollowed` row resets `created_at = now`.",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`follows.write`. Cross-user attempts return `USER_NOT_FOUND`.",
+        "operationId": "FollowService_Follow",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/headlinesV1Follow"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1FollowServiceFollowBody"
+            }
+          }
+        ],
+        "tags": [
+          "FollowService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/follows/{accountId}": {
+      "get": {
+        "summary": "GetFollow returns the edge regardless of status. Missing → `FOLLOW_NOT_FOUND`.",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`follows.read`.",
+        "operationId": "FollowService_GetFollow",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/headlinesV1Follow"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "FollowService"
+        ]
+      },
+      "delete": {
+        "summary": "Unfollow flips an `active` edge to `unfollowed`. No-op success on an\nalready-unfollowed row; `FOLLOW_NOT_FOUND` if no edge has ever\nexisted.",
+        "description": "Authorization: the User whose `id == request.user_id` OR a System with\n`follows.write`.",
+        "operationId": "FollowService_Unfollow",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/headlinesV1Follow"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "FollowService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/keys": {
+      "post": {
+        "summary": "AddUserKey registers an additional active key on a user.",
+        "description": "Authorization: USER_SELF OR System with `users.admin`.",
+        "operationId": "UserService_AddUserKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1UserKey"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UserServiceAddUserKeyBody"
+            }
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/keys/{keyId}/revoke": {
+      "post": {
+        "summary": "RevokeUserKey marks an existing key as revoked.",
+        "description": "Authorization: USER_SELF OR System with `users.admin`.\nLockout protection: the handler refuses to revoke the last active key\nunless the caller is a System with `admin.*` scope (operator rescue).",
+        "operationId": "UserService_RevokeUserKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1UserKey"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "keyId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UserServiceRevokeUserKeyBody"
+            }
+          }
+        ],
+        "tags": [
+          "UserService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/notification-preferences": {
+      "get": {
+        "summary": "GetUserNotificationPreferences — User self **or** System with\n`notifications.read`.",
+        "operationId": "NotificationService_GetUserNotificationPreferences",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1NotificationPreferences"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/notifications": {
+      "get": {
+        "summary": "ListUserNotifications — User self **or** System with `notifications.read`.",
+        "operationId": "NotificationService_ListUserNotifications",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListUserNotificationsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "pageToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "unreadOnly",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    },
+    "/v1/users/{userId}/notifications:mark-all-read": {
+      "post": {
+        "summary": "MarkAllUserNotificationsRead — User self **or** System with\n`notifications.admin`.",
+        "operationId": "NotificationService_MarkAllUserNotificationsRead",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1MarkAllUserNotificationsReadResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/NotificationServiceMarkAllUserNotificationsReadBody"
+            }
+          }
+        ],
+        "tags": [
+          "NotificationService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "AccountServiceAddAccountKeyBody": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/v1PublicKey"
+        }
+      }
+    },
+    "AccountServiceRevokeAccountKeyBody": {
+      "type": "object"
+    },
+    "ArticleServiceEditArticleBody": {
+      "type": "object",
+      "properties": {
+        "edit": {
+          "$ref": "#/definitions/v1ArticleEdit"
+        },
+        "updateMask": {
+          "type": "string"
+        }
+      }
+    },
+    "ArticleServicePublishArticleBody": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          }
+        }
+      }
+    },
+    "ArticleServiceRedactArticleVersionBody": {
+      "type": "object",
+      "properties": {
+        "redactionReason": {
+          "type": "string",
+          "title": "required, 1..=512 chars"
+        }
+      }
+    },
+    "ArticleServiceTombstoneArticleBody": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "title": "optional, ≤512 chars"
+        }
+      }
+    },
+    "DraftServiceCreateDraftBody": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          }
+        }
+      }
+    },
+    "DraftServicePublishDraftBody": {
+      "type": "object"
+    },
+    "DraftServiceUpdateDraftBody": {
+      "type": "object",
+      "properties": {
+        "draft": {
+          "type": "object",
+          "properties": {
+            "accountId": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "authorName": {
+              "type": "string"
+            },
+            "authorUrl": {
+              "type": "string"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "$ref": "#/definitions/v1Node"
+              }
+            },
+            "createdAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "updatedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "description": "Full Draft view, including content nodes.\n\n`id` is a UUIDv7 minted on `CreateDraft`; the same UUID becomes\n`articles.id` on `PublishDraft`."
+        },
+        "updateMask": {
+          "type": "string"
+        }
+      }
+    },
+    "FeedRecommendationServiceReplaceRecommendationFeedBody": {
+      "type": "object",
+      "properties": {
+        "articleIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Order is the feed order; position = index. Soft references — the ranker\nmay push article ids ahead of article ingestion."
+        }
+      }
+    },
+    "NotificationServiceMarkAllUserNotificationsReadBody": {
+      "type": "object"
+    },
+    "NotificationServiceMarkNotificationReadBody": {
+      "type": "object"
+    },
+    "UserServiceAddUserKeyBody": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/v1PublicKey"
+        }
+      }
+    },
+    "UserServiceRevokeUserKeyBody": {
+      "type": "object"
+    },
+    "headlinesV1Follow": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "accountId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1FollowStatus"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "unfollowedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "Follow is one `(user, account)` edge per `docs/design/follows.md`."
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1Account": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "shortName": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1AccountStatus"
+        },
+        "deletedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "Account is the publisher identity row. `id` is a UUIDv7."
+    },
+    "v1AccountKey": {
+      "type": "object",
+      "properties": {
+        "accountId": {
+          "type": "string"
+        },
+        "keyId": {
+          "type": "string"
+        },
+        "algo": {
+          "type": "string"
+        },
+        "publicKey": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1KeyStatus"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "AccountKey mirrors `account_keys` per `docs/design/data-model.md`."
+    },
+    "v1AccountStatus": {
+      "type": "string",
+      "enum": [
+        "ACCOUNT_STATUS_UNSPECIFIED",
+        "ACCOUNT_STATUS_ACTIVE",
+        "ACCOUNT_STATUS_DELETED"
+      ],
+      "default": "ACCOUNT_STATUS_UNSPECIFIED",
+      "description": "AccountStatus mirrors `accounts.status` per `docs/design/data-model.md`."
+    },
+    "v1AccountStreamItem": {
+      "type": "object",
+      "properties": {
+        "article": {
+          "$ref": "#/definitions/v1ArticleSummary"
+        }
+      },
+      "description": "AccountStreamItem carries an `ArticleSummary` per `account-stream.md`. The\nsummary's `state` discriminator already distinguishes LIVE from TOMBSTONE,\nso republishers consume one shape and dispatch on `state` (mirror to target\nplatform on LIVE; remove on TOMBSTONE). Body content is fetched separately\nvia `GetArticle` to honor the list-vs-view rule."
+    },
+    "v1Article": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "accountId": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/v1ArticleState"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "live": {
+          "$ref": "#/definitions/v1ArticleLive"
+        },
+        "tombstone": {
+          "$ref": "#/definitions/v1ArticleTombstone"
+        }
+      },
+      "description": "Full Article view, including content nodes when live.\n\n`id` is a UUIDv7 used directly as the public URL identifier (no slug)."
+    },
+    "v1ArticleEdit": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          }
+        }
+      },
+      "description": "Edit envelope used by EditArticle. Fields not selected by the caller's\nFieldMask are ignored; see `docs/design/articles.md`."
+    },
+    "v1ArticleLive": {
+      "type": "object",
+      "properties": {
+        "currentVersion": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          },
+          "description": "Empty when the current version's content has been redacted."
+        },
+        "redacted": {
+          "type": "boolean",
+          "description": "True when the current version's content has been redacted."
+        },
+        "publishedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1ArticleLiveSummary": {
+      "type": "object",
+      "properties": {
+        "currentVersion": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "redacted": {
+          "type": "boolean"
+        },
+        "publishedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1ArticleState": {
+      "type": "string",
+      "enum": [
+        "ARTICLE_STATE_UNSPECIFIED",
+        "ARTICLE_STATE_LIVE",
+        "ARTICLE_STATE_TOMBSTONE"
+      ],
+      "default": "ARTICLE_STATE_UNSPECIFIED"
+    },
+    "v1ArticleSummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "accountId": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/v1ArticleState"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "live": {
+          "$ref": "#/definitions/v1ArticleLiveSummary"
+        },
+        "tombstone": {
+          "$ref": "#/definitions/v1ArticleTombstoneSummary"
+        }
+      },
+      "description": "Compact view used by list/feed endpoints. Identical structure to `Article`\nminus the content nodes; clients fetch `GetArticle` for the full body."
+    },
+    "v1ArticleTombstone": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "tombstonedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1ArticleTombstoneSummary": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "tombstonedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1CreateAccountRequest": {
+      "type": "object",
+      "properties": {
+        "shortName": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "initialKey": {
+          "$ref": "#/definitions/v1PublicKey"
+        }
+      }
+    },
+    "v1CreateAccountResponse": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "$ref": "#/definitions/v1Account"
+        },
+        "keyId": {
+          "type": "string"
+        }
+      }
+    },
+    "v1CreateUserRequest": {
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string"
+        },
+        "initialKey": {
+          "$ref": "#/definitions/v1PublicKey"
+        }
+      }
+    },
+    "v1CreateUserResponse": {
+      "type": "object",
+      "properties": {
+        "user": {
+          "$ref": "#/definitions/v1User"
+        },
+        "keyId": {
+          "type": "string"
+        }
+      }
+    },
+    "v1Draft": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "accountId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "authorName": {
+          "type": "string"
+        },
+        "authorUrl": {
+          "type": "string"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "Full Draft view, including content nodes.\n\n`id` is a UUIDv7 minted on `CreateDraft`; the same UUID becomes\n`articles.id` on `PublishDraft`."
+    },
+    "v1DraftSummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "accountId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "Compact view used by list endpoints. No content nodes; clients fetch\n`GetDraft` for the full body."
+    },
+    "v1DwellProperties": {
+      "type": "object",
+      "properties": {
+        "dwellMs": {
+          "type": "string",
+          "format": "int64"
+        }
+      },
+      "description": "DWELL — time spent reading. Caller may emit multiple per session."
+    },
+    "v1Event": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "title": "UUIDv7, server-assigned"
+        },
+        "userId": {
+          "type": "string",
+          "title": "soft ref"
+        },
+        "articleId": {
+          "type": "string",
+          "title": "soft ref"
+        },
+        "type": {
+          "$ref": "#/definitions/v1EventType"
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time",
+          "title": "client-supplied"
+        },
+        "receivedAt": {
+          "type": "string",
+          "format": "date-time",
+          "title": "server-assigned (TSO)"
+        },
+        "surface": {
+          "type": "string",
+          "description": "'web', 'mobile', ..."
+        },
+        "impression": {
+          "$ref": "#/definitions/v1ImpressionProperties"
+        },
+        "open": {
+          "$ref": "#/definitions/v1OpenProperties"
+        },
+        "dwell": {
+          "$ref": "#/definitions/v1DwellProperties"
+        },
+        "like": {
+          "$ref": "#/definitions/v1LikeProperties"
+        },
+        "unlike": {
+          "$ref": "#/definitions/v1UnlikeProperties"
+        },
+        "share": {
+          "$ref": "#/definitions/v1ShareProperties"
+        }
+      },
+      "description": "Event — a single recorded activity row. `properties` oneof selector must\nmatch `type`; the service rejects mismatches with `EVENT_TYPE_MISMATCH`."
+    },
+    "v1EventType": {
+      "type": "string",
+      "enum": [
+        "EVENT_TYPE_UNSPECIFIED",
+        "EVENT_TYPE_IMPRESSION",
+        "EVENT_TYPE_OPEN",
+        "EVENT_TYPE_DWELL",
+        "EVENT_TYPE_LIKE",
+        "EVENT_TYPE_UNLIKE",
+        "EVENT_TYPE_SHARE"
+      ],
+      "default": "EVENT_TYPE_UNSPECIFIED",
+      "description": "EventType — the v1 vocabulary for user-activity events.\n\n`data-model.md` stores the discriminator as `text` so the wire enum and the\nDB column move in lockstep; the SCREAMING_SNAKE name (e.g. `IMPRESSION`)\nwithout the `EVENT_TYPE_` prefix is used as the DB string."
+    },
+    "v1FeedItem": {
+      "type": "object",
+      "properties": {
+        "position": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "article": {
+          "$ref": "#/definitions/v1ArticleSummary"
+        }
+      },
+      "description": "FeedItem carries an `ArticleSummary` per `feed-recommendation.md` so list\ncallers don't pay for content nodes; clients call `GetArticle` for the body."
+    },
+    "v1FollowFeedItem": {
+      "type": "object",
+      "properties": {
+        "article": {
+          "$ref": "#/definitions/v1ArticleSummary"
+        }
+      },
+      "description": "FollowFeedItem carries an `ArticleSummary` per `feed-follow.md`. Distinct\nfrom `FeedItem` (recommendation) — there is no `position` field; ordering is\ndata-driven by `article.created_at DESC` and is not server-assigned."
+    },
+    "v1FollowServiceFollowBody": {
+      "type": "object",
+      "properties": {
+        "accountId": {
+          "type": "string"
+        }
+      }
+    },
+    "v1FollowStatus": {
+      "type": "string",
+      "enum": [
+        "FOLLOW_STATUS_UNSPECIFIED",
+        "FOLLOW_STATUS_ACTIVE",
+        "FOLLOW_STATUS_UNFOLLOWED"
+      ],
+      "default": "FOLLOW_STATUS_UNSPECIFIED",
+      "description": "FollowStatus mirrors `follows.status` per `docs/design/data-model.md`."
+    },
+    "v1GetFollowFeedResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1FollowFeedItem"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1GetRecommendationFeedResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1FeedItem"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ImpressionProperties": {
+      "type": "object",
+      "properties": {
+        "feedKind": {
+          "type": "string"
+        },
+        "position": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "description": "IMPRESSION — article shown in a feed."
+    },
+    "v1KeyStatus": {
+      "type": "string",
+      "enum": [
+        "KEY_STATUS_UNSPECIFIED",
+        "KEY_STATUS_ACTIVE",
+        "KEY_STATUS_REVOKED"
+      ],
+      "default": "KEY_STATUS_UNSPECIFIED"
+    },
+    "v1LikeProperties": {
+      "type": "object",
+      "description": "LIKE — user liked an article. No payload."
+    },
+    "v1ListAccountArticlesResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1ArticleSummary"
+          },
+          "description": "No content nodes; clients call GetArticle for the full body."
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ListAccountDraftsResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1DraftSummary"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ListAccountFollowersResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/headlinesV1Follow"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ListEventsResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Event"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ListUserFollowsResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/headlinesV1Follow"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1ListUserNotificationsResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Notification"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1MarkAllUserNotificationsReadResponse": {
+      "type": "object",
+      "properties": {
+        "markedCount": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "v1Node": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "element": {
+          "$ref": "#/definitions/v1NodeElement"
+        }
+      },
+      "description": "Node is a recursive structured payload mirroring Telegraph's Node tree.\nEither a text leaf or an element with attributes and children."
+    },
+    "v1NodeElement": {
+      "type": "object",
+      "properties": {
+        "tag": {
+          "type": "string"
+        },
+        "attrs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Node"
+          }
+        }
+      }
+    },
+    "v1Notification": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "articleId": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/v1NotificationKind"
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/v1NotificationChannel"
+          }
+        },
+        "payload": {
+          "$ref": "#/definitions/v1NotificationPayload"
+        },
+        "status": {
+          "$ref": "#/definitions/v1NotificationStatus"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "deliveredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "readAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1NotificationChannel": {
+      "type": "string",
+      "enum": [
+        "NOTIFICATION_CHANNEL_UNSPECIFIED",
+        "NOTIFICATION_CHANNEL_PUSH",
+        "NOTIFICATION_CHANNEL_EMAIL",
+        "NOTIFICATION_CHANNEL_SMS",
+        "NOTIFICATION_CHANNEL_IN_APP"
+      ],
+      "default": "NOTIFICATION_CHANNEL_UNSPECIFIED"
+    },
+    "v1NotificationKind": {
+      "type": "string",
+      "enum": [
+        "NOTIFICATION_KIND_UNSPECIFIED",
+        "NOTIFICATION_KIND_NEW_ARTICLE",
+        "NOTIFICATION_KIND_NEW_FOLLOWER",
+        "NOTIFICATION_KIND_ARTICLE_TOMBSTONED",
+        "NOTIFICATION_KIND_ARTICLE_EDITED",
+        "NOTIFICATION_KIND_MENTION",
+        "NOTIFICATION_KIND_REPLY",
+        "NOTIFICATION_KIND_SYSTEM"
+      ],
+      "default": "NOTIFICATION_KIND_UNSPECIFIED"
+    },
+    "v1NotificationPayload": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "imageUrl": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "v1NotificationPreferences": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "disabledChannels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/v1NotificationChannel"
+          }
+        },
+        "disabledKinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/v1NotificationKind"
+          }
+        },
+        "quietHours": {
+          "$ref": "#/definitions/v1QuietHours"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1NotificationStatus": {
+      "type": "string",
+      "enum": [
+        "NOTIFICATION_STATUS_UNSPECIFIED",
+        "NOTIFICATION_STATUS_PENDING",
+        "NOTIFICATION_STATUS_DELIVERED",
+        "NOTIFICATION_STATUS_FAILED",
+        "NOTIFICATION_STATUS_READ"
+      ],
+      "default": "NOTIFICATION_STATUS_UNSPECIFIED"
+    },
+    "v1OpenProperties": {
+      "type": "object",
+      "properties": {
+        "feedKind": {
+          "type": "string"
+        },
+        "position": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "description": "OPEN — user opened the article detail view."
+    },
+    "v1PublicKey": {
+      "type": "object",
+      "properties": {
+        "algo": {
+          "type": "string"
+        },
+        "publicKey": {
+          "type": "string"
+        }
+      },
+      "description": "PublicKey carries an algorithm name plus the base64-encoded raw key bytes.\nThe exact format of `public_key` is defined by `algo` (e.g. for `ed25519`,\nthe bytes are the 32-byte raw public key, base64-encoded → 44 chars)."
+    },
+    "v1QuietHours": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "timezone": {
+          "type": "string"
+        },
+        "startHour": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "endHour": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "v1RecordEventBatchRequest": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1RecordEventRequest"
+          }
+        }
+      }
+    },
+    "v1RecordEventBatchResponse": {
+      "type": "object",
+      "properties": {
+        "recorded": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Event"
+          },
+          "description": "Same order as the request, populated with id + received_at."
+        },
+        "storedCount": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "v1RecordEventRequest": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "articleId": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/v1EventType"
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "impression": {
+          "$ref": "#/definitions/v1ImpressionProperties"
+        },
+        "open": {
+          "$ref": "#/definitions/v1OpenProperties"
+        },
+        "dwell": {
+          "$ref": "#/definitions/v1DwellProperties"
+        },
+        "like": {
+          "$ref": "#/definitions/v1LikeProperties"
+        },
+        "unlike": {
+          "$ref": "#/definitions/v1UnlikeProperties"
+        },
+        "share": {
+          "$ref": "#/definitions/v1ShareProperties"
+        }
+      }
+    },
+    "v1ReplaceRecommendationFeedResponse": {
+      "type": "object",
+      "properties": {
+        "storedCount": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "v1SendNotificationBatchRequest": {
+      "type": "object",
+      "properties": {
+        "notifications": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1SendNotificationRequest"
+          }
+        }
+      }
+    },
+    "v1SendNotificationBatchResponse": {
+      "type": "object",
+      "properties": {
+        "recorded": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Notification"
+          }
+        },
+        "storedCount": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "v1SendNotificationRequest": {
+      "type": "object",
+      "properties": {
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "articleId": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/v1NotificationKind"
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/v1NotificationChannel"
+          }
+        },
+        "payload": {
+          "$ref": "#/definitions/v1NotificationPayload"
+        }
+      }
+    },
+    "v1ShareProperties": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "description": "SHARE — user shared (e.g. `twitter`, `copy_link`)."
+    },
+    "v1StreamAccountArticlesResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1AccountStreamItem"
+          }
+        },
+        "nextPageToken": {
+          "type": "string"
+        }
+      }
+    },
+    "v1UnlikeProperties": {
+      "type": "object",
+      "description": "UNLIKE — user reverted a like. No payload."
+    },
+    "v1User": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1UserStatus"
+        },
+        "deletedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "User is the consumer identity row. `id` is a UUIDv7."
+    },
+    "v1UserKey": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "keyId": {
+          "type": "string"
+        },
+        "algo": {
+          "type": "string"
+        },
+        "publicKey": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1KeyStatus"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "description": "UserKey mirrors `user_keys` per `docs/design/data-model.md`."
+    },
+    "v1UserStatus": {
+      "type": "string",
+      "enum": [
+        "USER_STATUS_UNSPECIFIED",
+        "USER_STATUS_ACTIVE",
+        "USER_STATUS_DELETED"
+      ],
+      "default": "USER_STATUS_UNSPECIFIED",
+      "description": "UserStatus mirrors `users.status` per `docs/design/data-model.md`."
+    }
+  }
+}

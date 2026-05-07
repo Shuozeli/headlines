@@ -143,9 +143,9 @@ No `ListAccounts`, no `ListAccountKeys` in v1. Clients track `key_id`s returned 
 
 | Field | Rule |
 |---|---|
-| `short_name` | 1–32 chars; `[A-Za-z0-9 _-]`; trimmed; `INVALID_ARGUMENT` otherwise |
-| `author_name` | 1–128 chars; non-empty after trim |
-| `author_url` | empty or valid `http(s)://` URL, ≤512 chars |
+| `short_name` | 1–32 **chars**; `[A-Za-z0-9 _-]`; trimmed; `INVALID_ARGUMENT` otherwise |
+| `author_name` | 1–128 **chars** (Unicode, no charset restriction); non-empty after trim |
+| `author_url` | empty or valid `http(s)://` URL, ≤512 **bytes** (URL is opaque) |
 | `PublicKey.algo` | must be in the auth layer's registered algorithm set; else `UNSUPPORTED_ALGORITHM` |
 | `PublicKey.public_key` | format validated by algorithm impl (e.g. Ed25519 = 32 raw bytes, base64-encoded → 44 chars); else `INVALID_PUBLIC_KEY` |
 | `update_mask` paths | only `short_name`, `author_name`, `author_url`; other paths → `INVALID_ARGUMENT` |

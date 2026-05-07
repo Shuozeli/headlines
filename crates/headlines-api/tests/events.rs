@@ -1294,6 +1294,47 @@ async fn list_filters_by_types_union() {
 }
 
 #[tokio::test]
+async fn list_events_rejects_unspecified_in_types_filter() {
+    skip_if_no_db!();
+
+    // Arrange — system caller with `events.read`, request with a mixed
+    // `types` list that includes `EVENT_TYPE_UNSPECIFIED`. Same rule as the
+    // write-side `type` validation: silently dropping the unspecified entry
+    // would mask a client-side enum-encoding bug.
+    let mut h = spawn_server().await;
+    let sys_sk = make_signing_key();
+    let (system_id, sys_key) =
+        insert_system(&h.db, "events-r-bad", &["events.read"], &sys_sk).await;
+    let user_id = Uuid::now_v7();
+    let list_req = ListEventsRequest {
+        user_id: user_id.to_string(),
+        types: vec![EventType::Open as i32, EventType::Unspecified as i32],
+        page_size: 50,
+        ..Default::default()
+    };
+    let ts = h.clock.now().await.unwrap();
+
+    // Act
+    let res = h
+        .client
+        .list_events(signed(
+            list_req,
+            &sys_sk,
+            sys_key,
+            RPC_LIST,
+            ts,
+            &unique_nonce(),
+        ))
+        .await;
+
+    // Assert
+    let err = res.expect_err("UNSPECIFIED in types filter must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    cleanup_system(&h.db, system_id).await;
+}
+
+#[tokio::test]
 async fn list_filters_by_received_after_and_before() {
     skip_if_no_db!();
 
