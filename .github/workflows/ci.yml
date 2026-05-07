@@ -11,7 +11,7 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -24,7 +24,7 @@ jobs:
     name: cargo clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install Rust
@@ -39,7 +39,7 @@ jobs:
     name: cargo build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install Rust
@@ -69,7 +69,7 @@ jobs:
       DATABASE_URL: postgres://cyuan:cyuan@localhost:5432/headlines
       PGPASSWORD: cyuan
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install protoc and psql client
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
       - name: Apply migrations to fresh Postgres
@@ -104,8 +104,10 @@ jobs:
     name: buf lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Lint protos
         run: buf lint
 
@@ -116,10 +118,12 @@ jobs:
     # informational until the proto baseline lands.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Check breaking changes against main
         run: buf breaking --against '.git#branch=main'
 
@@ -143,7 +147,7 @@ jobs:
     env:
       DATABASE_URL: postgres://cyuan:cyuan@localhost:5432/headlines
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -182,8 +186,10 @@ jobs:
     name: openapi drift (buf generate vs committed swagger.json)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Regenerate OpenAPI spec
         run: buf generate
       - name: Diff committed OpenAPI against `buf generate` output
@@ -198,7 +204,7 @@ jobs:
     # fails the run. Each ignore entry must carry a justification comment
     # and an expiry date.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
