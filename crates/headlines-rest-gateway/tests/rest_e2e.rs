@@ -13,17 +13,22 @@
 //! `DELETE` keyed on this test's UUIDs only — never `TRUNCATE`. AAA structure
 //! per `~/.claude/rules/testing-patterns.md`.
 //!
-//! ## Signing note
+//! ## Signing note (post Bug 2 / Position A architectural fix)
 //!
-//! The current REST gateway forwards the inbound `Authorization` header
-//! verbatim into outbound gRPC metadata; the gateway does **not** re-derive a
-//! body hash off the JSON it received. Authentication therefore happens
-//! downstream at the gRPC server's `AuthInterceptor`, where the canonical
-//! string fields are `(method=POST, path=/headlines.v1.Foo/Bar, body=proto
-//! bytes)` — i.e. the gRPC method path, **not** the REST URL path the client
-//! actually hit. Tests that need a valid signature therefore sign with the
-//! gRPC method path. See `rest_create_account_signed_path` for an explicit
-//! comparison and the bug observation in this file's report.
+//! The REST gateway now runs `SignedRequestStrategy::authenticate` against
+//! the inbound REST request itself. The canonical string is built off
+//! `(method = REST verb, path = REST URL, body_hash = sha256(canonical
+//! proto encoding the gateway will forward, query = sorted)`. On success
+//! the gateway forwards the resolved `Subject` to the **trusted** in-process
+//! gRPC listener via the `TRUSTED_SUBJECT_HEADER` metadata key, and the
+//! signature-verifying `AuthInterceptor` is bypassed there. The public gRPC
+//! listener still requires direct gRPC clients to sign with the gRPC method
+//! path; the REST surface signs with the REST URL.
+//!
+//! See `rest_create_account_signed_path` for the canonical
+//! REST-URL-signing example, and
+//! `gateway_rejects_forged_trusted_subject_header_on_public_listener` for
+//! the forgery-rejection assertion.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -51,6 +56,7 @@ use headlines_api::{
 use headlines_auth::{
     AlgorithmRegistry, AuthInterceptor, AuthorizationLayer, Ed25519, InMemoryNonceStore,
     LocalClock, PostgresKeyResolver, ProtoBodyHasher, SignedRequestStrategy,
+    TrustedSubjectInterceptor,
 };
 use headlines_core::{TimeSource as _, Tso};
 use headlines_proto::v1::{
@@ -84,7 +90,11 @@ struct FullStack {
     db: Db,
     rest_base: String,
     clock: Arc<LocalClock>,
-    _grpc_addr: SocketAddr,
+    /// Public gRPC listener address — exposed so a test can dial it
+    /// directly (e.g. to assert a forged trusted-subject header is
+    /// rejected on the public surface).
+    public_grpc_addr: SocketAddr,
+    _trusted_grpc_addr: SocketAddr,
     _rest_addr: SocketAddr,
 }
 
@@ -94,7 +104,17 @@ async fn maybe_connect_db() -> Option<Db> {
 }
 
 /// Spin up the full pipeline:
-///   reqwest → axum (random port) → tonic Channel → gRPC (random port) → DB.
+///   reqwest → axum (random port) → tonic Channel → trusted gRPC (random port) → DB.
+///
+/// Bug 2 architectural fix: the gRPC layer is now split into two listeners,
+/// mirroring `crates/headlines-server/src/main.rs`:
+///
+/// - **public** listener on `127.0.0.1:<auto>` wrapped with the
+///   signature-verifying `AuthInterceptor`. External clients dial here.
+/// - **trusted** listener on `127.0.0.1:<auto>` wrapped with
+///   `TrustedSubjectInterceptor`. The REST gateway dials here after running
+///   its own auth strategy on the inbound REST request and forwarding the
+///   resolved `Subject` via `TRUSTED_SUBJECT_HEADER`.
 async fn spawn_full_stack() -> FullStack {
     let db = maybe_connect_db()
         .await
@@ -112,94 +132,149 @@ async fn spawn_full_stack() -> FullStack {
         nonces,
     ));
 
-    // ---- 10 ServiceImpl instances ----
+    // ---- Repos shared between both listeners ----
     let account_repo = Arc::new(PgAccountRepo::new(db.clone()));
     let key_repo = Arc::new(PgKeyRepo::new(db.clone()));
-    let account_svc = AccountServiceImpl::new(
-        account_repo,
-        key_repo.clone(),
-        algos.clone(),
-        BootstrapMode::Open,
-    );
-
     let user_repo = Arc::new(PgUserRepo::new(db.clone()));
-    let user_svc = UserServiceImpl::new(
-        user_repo,
-        key_repo.clone(),
-        algos.clone(),
-        BootstrapMode::Open,
-    );
-
     let article_account_repo = Arc::new(PgAccountRepo::new(db.clone()));
     let article_repo = Arc::new(PgArticleRepo::new(db.clone()));
-    let article_svc =
-        ArticleServiceImpl::new(article_account_repo, article_repo, TEST_CONTENT_MAX_BYTES);
-
     let draft_account_repo = Arc::new(PgAccountRepo::new(db.clone()));
     let draft_repo = Arc::new(PgDraftRepo::new(db.clone()));
-    let draft_svc = DraftServiceImpl::new(draft_account_repo, draft_repo, TEST_CONTENT_MAX_BYTES);
-
     let follow_user_repo = Arc::new(PgUserRepo::new(db.clone()));
     let follow_account_repo = Arc::new(PgAccountRepo::new(db.clone()));
     let follow_repo = Arc::new(PgFollowRepo::new(db.clone()));
-    let follow_svc = FollowServiceImpl::new(follow_user_repo, follow_account_repo, follow_repo);
-
     let feed_user_repo = Arc::new(PgUserRepo::new(db.clone()));
     let feed_repo = Arc::new(PgFeedRecommendationRepo::new(db.clone()));
-    let feed_recommendation_svc =
-        FeedRecommendationServiceImpl::new(feed_user_repo, feed_repo, TEST_FEEDS_REPLACE_MAX_ITEMS);
-
     let feed_follow_user_repo = Arc::new(PgUserRepo::new(db.clone()));
     let feed_follow_repo = Arc::new(PgFeedFollowRepo::new(db.clone()));
-    let feed_follow_svc = FeedFollowServiceImpl::new(feed_follow_user_repo, feed_follow_repo);
-
     let stream_account_repo = Arc::new(PgAccountRepo::new(db.clone()));
     let stream_repo = Arc::new(PgAccountStreamRepo::new(db.clone()));
-    let account_stream_svc = AccountStreamServiceImpl::new(stream_account_repo, stream_repo);
-
     let event_repo = Arc::new(PgEventRepo::new(db.clone()));
-    let event_svc = EventServiceImpl::new(event_repo, clock.clone(), TEST_EVENTS_BATCH_MAX_ITEMS);
 
-    let notification_svc = NotificationServiceImpl::new();
+    let make_account = || {
+        AccountServiceImpl::new(
+            account_repo.clone(),
+            key_repo.clone(),
+            algos.clone(),
+            BootstrapMode::Open,
+        )
+    };
+    let make_user = || {
+        UserServiceImpl::new(
+            user_repo.clone(),
+            key_repo.clone(),
+            algos.clone(),
+            BootstrapMode::Open,
+        )
+    };
+    let make_article = || {
+        ArticleServiceImpl::new(
+            article_account_repo.clone(),
+            article_repo.clone(),
+            TEST_CONTENT_MAX_BYTES,
+        )
+    };
+    let make_draft = || {
+        DraftServiceImpl::new(
+            draft_account_repo.clone(),
+            draft_repo.clone(),
+            TEST_CONTENT_MAX_BYTES,
+        )
+    };
+    let make_follow = || {
+        FollowServiceImpl::new(
+            follow_user_repo.clone(),
+            follow_account_repo.clone(),
+            follow_repo.clone(),
+        )
+    };
+    let make_feed_recommendation = || {
+        FeedRecommendationServiceImpl::new(
+            feed_user_repo.clone(),
+            feed_repo.clone(),
+            TEST_FEEDS_REPLACE_MAX_ITEMS,
+        )
+    };
+    let make_feed_follow =
+        || FeedFollowServiceImpl::new(feed_follow_user_repo.clone(), feed_follow_repo.clone());
+    let make_account_stream =
+        || AccountStreamServiceImpl::new(stream_account_repo.clone(), stream_repo.clone());
+    let make_event = || {
+        EventServiceImpl::new(
+            event_repo.clone(),
+            clock.clone(),
+            TEST_EVENTS_BATCH_MAX_ITEMS,
+        )
+    };
+    let make_notification = NotificationServiceImpl::new;
 
-    // ---- Tower stack: AuthInterceptor → AuthorizationLayer → TraceLayer ----
-    let interceptor = AuthInterceptor::new(strategy, Arc::new(ProtoBodyHasher));
-    let authorize = AuthorizationLayer::new();
-    let trace = tower_http::trace::TraceLayer::new_for_grpc();
+    // ---- Public gRPC listener (signature-verifying) ----
+    let public_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral public gRPC port");
+    public_listener.set_nonblocking(true).unwrap();
+    let public_grpc_addr = public_listener.local_addr().unwrap();
+    let public_listener = tokio::net::TcpListener::from_std(public_listener).unwrap();
+    let public_inc = tokio_stream::wrappers::TcpListenerStream::new(public_listener);
 
-    // ---- gRPC server on a random port ----
-    let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    grpc_listener.set_nonblocking(true).unwrap();
-    let grpc_addr = grpc_listener.local_addr().unwrap();
-    let grpc_listener = tokio::net::TcpListener::from_std(grpc_listener).unwrap();
-    let grpc_inc = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
-
-    let server = Server::builder()
-        .layer(trace)
+    let interceptor = AuthInterceptor::new(strategy.clone(), Arc::new(ProtoBodyHasher));
+    let authorize_public = AuthorizationLayer::new();
+    let trace_public = tower_http::trace::TraceLayer::new_for_grpc();
+    let public_server = Server::builder()
+        .layer(trace_public)
         .layer(interceptor)
-        .layer(authorize)
-        .add_service(AccountServiceServer::new(account_svc))
-        .add_service(UserServiceServer::new(user_svc))
-        .add_service(ArticleServiceServer::new(article_svc))
-        .add_service(DraftServiceServer::new(draft_svc))
-        .add_service(FollowServiceServer::new(follow_svc))
+        .layer(authorize_public)
+        .add_service(AccountServiceServer::new(make_account()))
+        .add_service(UserServiceServer::new(make_user()))
+        .add_service(ArticleServiceServer::new(make_article()))
+        .add_service(DraftServiceServer::new(make_draft()))
+        .add_service(FollowServiceServer::new(make_follow()))
         .add_service(FeedRecommendationServiceServer::new(
-            feed_recommendation_svc,
+            make_feed_recommendation(),
         ))
-        .add_service(FeedFollowServiceServer::new(feed_follow_svc))
-        .add_service(AccountStreamServiceServer::new(account_stream_svc))
-        .add_service(EventServiceServer::new(event_svc))
-        .add_service(NotificationServiceServer::new(notification_svc));
-
+        .add_service(FeedFollowServiceServer::new(make_feed_follow()))
+        .add_service(AccountStreamServiceServer::new(make_account_stream()))
+        .add_service(EventServiceServer::new(make_event()))
+        .add_service(NotificationServiceServer::new(make_notification()));
     tokio::spawn(async move {
-        let _ = server.serve_with_incoming(grpc_inc).await;
+        let _ = public_server.serve_with_incoming(public_inc).await;
     });
 
-    // ---- Build the REST router off a tonic Channel pointing at the gRPC port ----
-    let grpc_endpoint = format!("http://{grpc_addr}");
+    // ---- Trusted internal gRPC listener (loopback only) ----
+    let trusted_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral trusted gRPC port");
+    trusted_listener.set_nonblocking(true).unwrap();
+    let trusted_grpc_addr = trusted_listener.local_addr().unwrap();
+    let trusted_listener = tokio::net::TcpListener::from_std(trusted_listener).unwrap();
+    let trusted_inc = tokio_stream::wrappers::TcpListenerStream::new(trusted_listener);
+
+    let trusted_layer = TrustedSubjectInterceptor::new();
+    let authorize_trusted = AuthorizationLayer::new();
+    let trace_trusted = tower_http::trace::TraceLayer::new_for_grpc();
+    let trusted_server = Server::builder()
+        .layer(trace_trusted)
+        .layer(trusted_layer)
+        .layer(authorize_trusted)
+        .add_service(AccountServiceServer::new(make_account()))
+        .add_service(UserServiceServer::new(make_user()))
+        .add_service(ArticleServiceServer::new(make_article()))
+        .add_service(DraftServiceServer::new(make_draft()))
+        .add_service(FollowServiceServer::new(make_follow()))
+        .add_service(FeedRecommendationServiceServer::new(
+            make_feed_recommendation(),
+        ))
+        .add_service(FeedFollowServiceServer::new(make_feed_follow()))
+        .add_service(AccountStreamServiceServer::new(make_account_stream()))
+        .add_service(EventServiceServer::new(make_event()))
+        .add_service(NotificationServiceServer::new(make_notification()));
+    tokio::spawn(async move {
+        let _ = trusted_server.serve_with_incoming(trusted_inc).await;
+    });
+
+    // ---- Build the REST router pointing at the trusted listener ----
+    let grpc_endpoint = format!("http://{trusted_grpc_addr}");
     let mut router = None;
     for _ in 0..50 {
-        match headlines_rest_gateway::build_app(&grpc_endpoint).await {
+        match headlines_rest_gateway::build_app(&grpc_endpoint, strategy.clone()).await {
             Ok(r) => {
                 router = Some(r);
                 break;
@@ -207,7 +282,7 @@ async fn spawn_full_stack() -> FullStack {
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
-    let router = router.expect("REST gateway must connect to gRPC server");
+    let router = router.expect("REST gateway must connect to trusted gRPC server");
 
     // ---- REST server on its own random port ----
     let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -222,7 +297,8 @@ async fn spawn_full_stack() -> FullStack {
         db,
         rest_base,
         clock,
-        _grpc_addr: grpc_addr,
+        public_grpc_addr,
+        _trusted_grpc_addr: trusted_grpc_addr,
         _rest_addr: rest_addr,
     }
 }
@@ -233,11 +309,11 @@ async fn spawn_full_stack() -> FullStack {
 
 /// Build a `HEADLINES-SIGN-V1` `Authorization` header value.
 ///
-/// `path` is the canonical-string path. Per the bug noted at the top of this
-/// file, the gRPC server's `AuthInterceptor` re-derives the canonical from
-/// the inbound HTTP `Request`, which (after gateway forwarding) carries the
-/// **gRPC** method path. So `path` here should be the gRPC method path even
-/// when the client hit the REST URL.
+/// `path` is the canonical-string path. After the Bug 2 architectural fix,
+/// the REST gateway runs the auth strategy on the inbound REST request and
+/// canonicalises against the **REST URL** path the client actually called
+/// (e.g. `/v1/articles/{id}/tombstone`), so this helper takes the REST URL
+/// path verbatim.
 fn sign_rest_request(
     method: &str,
     path: &str,
@@ -680,17 +756,13 @@ async fn rest_create_account_open_mode() {
     .await;
 }
 
-// 4. Signed POST round-trip via the gateway. Documents one remaining
-// quirk after Bug 1 was fixed (POST /v1/accounts is now wired):
+// 4. Signed POST round-trip via the gateway. Bug 2 / Position A fix:
 //
-//   Signed REST requests authenticate correctly when the canonical
-//   string uses the **gRPC method path** (`/headlines.v1.X/Y`), not
-//   the **REST URL path** (`/v1/...`). The gateway forwards the
-//   `Authorization` header verbatim, so the downstream gRPC
-//   `AuthInterceptor` verifies against the gRPC path it actually
-//   sees on its inbound request. This contradicts the prompt /
-//   design intent ("REST signing covers the REST URL path"); the
-//   report calls it out (Bug 2 — out of scope for this fix).
+//   The gateway now runs the auth strategy on the inbound REST request and
+//   canonicalises against the **REST URL** the client called. A signature
+//   built off `/v1/articles/{id}/tombstone` therefore authenticates; a
+//   signature built off the gRPC method path does not (the gateway no
+//   longer forwards the inbound `Authorization` header).
 //
 // We exercise the signed code path through `POST /v1/articles/{id}/tombstone`
 // with an account-self signature — that's a real "POST /v1/..." route the
@@ -713,13 +785,13 @@ async fn rest_create_account_signed_path() {
     let body_bytes = req_proto.encode_to_vec();
     let body_json = json!({"reason": "rest-e2e"});
 
-    // Act 1 — sign with the REST URL path. The gateway forwards the
-    // header verbatim, so the gRPC server's interceptor verifies against
-    // the gRPC method path and rejects.
+    // Act — sign with the REST URL path. After the architectural fix
+    // this is the canonical-string path the gateway verifies against.
     let ts = h.clock.now().await.unwrap();
+    let rest_url = format!("/v1/articles/{}/tombstone", article_id);
     let auth_rest_path = sign_rest_request(
         "POST",
-        &format!("/v1/articles/{}/tombstone", article_id),
+        &rest_url,
         "",
         &body_bytes,
         account_key_id,
@@ -728,55 +800,21 @@ async fn rest_create_account_signed_path() {
         &unique_nonce(),
     );
     let resp_rest_path = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/articles/{}/tombstone",
-            h.rest_base, article_id
-        ))
+        .post(format!("{}{}", h.rest_base, rest_url))
         .header(reqwest::header::AUTHORIZATION, &auth_rest_path)
         .json(&body_json)
         .send()
         .await
         .expect("REST request must reach the gateway");
-    let rest_path_status = resp_rest_path.status();
 
-    // Act 2 — sign with the gRPC method path; this matches today's
-    // forwarding behavior.
-    let ts2 = h.clock.now().await.unwrap();
-    let auth_grpc_path = sign_rest_request(
-        "POST",
-        "/headlines.v1.ArticleService/TombstoneArticle",
-        "",
-        &body_bytes,
-        account_key_id,
-        &acct_sk,
-        ts2,
-        &unique_nonce(),
-    );
-    let resp_grpc_path = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/articles/{}/tombstone",
-            h.rest_base, article_id
-        ))
-        .header(reqwest::header::AUTHORIZATION, &auth_grpc_path)
-        .json(&body_json)
-        .send()
-        .await
-        .expect("REST request must reach the gateway");
-
-    // Assert — REST-URL-path signature is rejected (401); the
-    // gRPC-method-path signature authenticates and the tombstone goes
-    // through (200 + state == TOMBSTONE).
-    assert!(
-        rest_path_status.is_client_error() || rest_path_status.is_server_error(),
-        "REST-URL-path signature should currently be rejected; got {}",
-        rest_path_status
-    );
+    // Assert — REST-URL signature must authenticate and the tombstone
+    // goes through (200 + state == TOMBSTONE).
     assert_eq!(
-        resp_grpc_path.status(),
+        resp_rest_path.status(),
         StatusCode::OK,
-        "gRPC-method-path signature must authenticate"
+        "REST-URL-path signature must authenticate (Bug 2 fix)"
     );
-    let resp_body: Value = resp_grpc_path.json().await.expect("body must be JSON");
+    let resp_body: Value = resp_rest_path.json().await.expect("body must be JSON");
     assert_eq!(resp_body["id"], article_id.to_string());
     assert_eq!(resp_body["state"], "ARTICLE_STATE_TOMBSTONE");
 
@@ -934,9 +972,10 @@ async fn rest_publish_article_signed() {
     });
 
     let ts = h.clock.now().await.unwrap();
+    let rest_url = format!("/v1/accounts/{}/articles", account_id);
     let auth = sign_rest_request(
         "POST",
-        "/headlines.v1.ArticleService/PublishArticle",
+        &rest_url,
         "",
         &body_bytes,
         account_key_id,
@@ -947,10 +986,7 @@ async fn rest_publish_article_signed() {
 
     // Act
     let resp = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/accounts/{}/articles",
-            h.rest_base, account_id
-        ))
+        .post(format!("{}{}", h.rest_base, rest_url))
         .header(reqwest::header::AUTHORIZATION, auth)
         .json(&body_json)
         .send()
@@ -1014,13 +1050,14 @@ async fn rest_replace_recommendation_feed_system_only() {
     let body_bytes = req_proto.encode_to_vec();
     let body_json = json!({"article_ids": [article_id.to_string()]});
 
-    // Act 1 — System with the right scope succeeds. Note the canonical
-    // method is "POST": the gateway forwards via a gRPC unary call which
-    // is always HTTP/2 POST under tonic, regardless of the REST verb.
+    // Act 1 — System with the right scope succeeds. The gateway
+    // canonicalises against the REST verb + REST URL the client called,
+    // so we sign "PUT /v1/users/{id}/feed/recommendation".
     let ts = h.clock.now().await.unwrap();
+    let rest_url = format!("/v1/users/{}/feed/recommendation", user_id);
     let auth_sys = sign_rest_request(
-        "POST",
-        "/headlines.v1.FeedRecommendationService/ReplaceRecommendationFeed",
+        "PUT",
+        &rest_url,
         "",
         &body_bytes,
         sys_key_id,
@@ -1029,10 +1066,7 @@ async fn rest_replace_recommendation_feed_system_only() {
         &unique_nonce(),
     );
     let resp_sys = reqwest::Client::new()
-        .put(format!(
-            "{}/v1/users/{}/feed/recommendation",
-            h.rest_base, user_id
-        ))
+        .put(format!("{}{}", h.rest_base, rest_url))
         .header(reqwest::header::AUTHORIZATION, auth_sys)
         .json(&body_json)
         .send()
@@ -1042,8 +1076,8 @@ async fn rest_replace_recommendation_feed_system_only() {
     // Act 2 — user-self attempt should be PERMISSION_DENIED.
     let ts2 = h.clock.now().await.unwrap();
     let auth_user = sign_rest_request(
-        "POST",
-        "/headlines.v1.FeedRecommendationService/ReplaceRecommendationFeed",
+        "PUT",
+        &rest_url,
         "",
         &body_bytes,
         user_key_id,
@@ -1052,10 +1086,7 @@ async fn rest_replace_recommendation_feed_system_only() {
         &unique_nonce(),
     );
     let resp_user = reqwest::Client::new()
-        .put(format!(
-            "{}/v1/users/{}/feed/recommendation",
-            h.rest_base, user_id
-        ))
+        .put(format!("{}{}", h.rest_base, rest_url))
         .header(reqwest::header::AUTHORIZATION, auth_user)
         .json(&body_json)
         .send()
@@ -1128,7 +1159,7 @@ async fn rest_record_event_user_self() {
     let ts = h.clock.now().await.unwrap();
     let auth = sign_rest_request(
         "POST",
-        "/headlines.v1.EventService/RecordEvent",
+        "/v1/events",
         "",
         &body_bytes,
         user_key_id,
@@ -1185,20 +1216,23 @@ async fn rest_stream_account_articles_system_scope() {
     let (system_id, sys_key_id) =
         seed_system(&h.db, "rest-streamer", &["articles.stream"], &sys_sk).await;
 
-    // Page 1: page_size=1, no token. The gateway forwards `?page_size=1`
-    // as proto fields; the server's interceptor canonicalizes the query
-    // string `page_size=1` into the signing canonical.
+    // Page 1: page_size=1, no token. After the Bug 2 fix the gateway
+    // canonicalises against `(GET, /v1/accounts/{id}/article-stream,
+    // canonicalize_query("page_size=1"))`. The body hash covers the
+    // proto-encoded StreamAccountArticlesRequest the gateway will forward
+    // (account_id from path, page_size=1 from query).
     let req1 = headlines_proto::v1::StreamAccountArticlesRequest {
         account_id: account_id.to_string(),
         page_size: 1,
         page_token: String::new(),
     };
     let body1 = req1.encode_to_vec();
+    let rest_url = format!("/v1/accounts/{}/article-stream", account_id);
     let ts1 = h.clock.now().await.unwrap();
     let auth1 = sign_rest_request(
-        "POST",
-        "/headlines.v1.AccountStreamService/StreamAccountArticles",
-        "",
+        "GET",
+        &rest_url,
+        "page_size=1",
         &body1,
         sys_key_id,
         &sys_sk,
@@ -1208,10 +1242,7 @@ async fn rest_stream_account_articles_system_scope() {
 
     // Act 1
     let resp1 = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/accounts/{}/article-stream?page_size=1",
-            h.rest_base, account_id
-        ))
+        .get(format!("{}{}?page_size=1", h.rest_base, rest_url))
         .header(reqwest::header::AUTHORIZATION, auth1)
         .send()
         .await
@@ -1227,17 +1258,24 @@ async fn rest_stream_account_articles_system_scope() {
     assert!(!token.is_empty(), "first page must yield a cursor");
 
     // Page 2 — sign separately with the new token in the request body.
+    // The canonical query is the sorted form of `page_size=1&page_token=...`
+    // (already alphabetical). The wire URL pre-canonicalisation is
+    // `?page_size=1&page_token=<encoded>`; the gateway runs
+    // `canonicalize_query` so both forms hash identically.
     let req2 = headlines_proto::v1::StreamAccountArticlesRequest {
         account_id: account_id.to_string(),
         page_size: 1,
         page_token: token.clone(),
     };
     let body2 = req2.encode_to_vec();
+    // canonicalize_query keeps percent-encoding verbatim, so we have to
+    // sign over the same encoded form the gateway sees on the wire.
+    let canonical_query = format!("page_size=1&page_token={}", urlencode(&token));
     let ts2 = h.clock.now().await.unwrap();
     let auth2 = sign_rest_request(
-        "POST",
-        "/headlines.v1.AccountStreamService/StreamAccountArticles",
-        "",
+        "GET",
+        &rest_url,
+        &canonical_query,
         &body2,
         sys_key_id,
         &sys_sk,
@@ -1246,9 +1284,9 @@ async fn rest_stream_account_articles_system_scope() {
     );
     let resp2 = reqwest::Client::new()
         .get(format!(
-            "{}/v1/accounts/{}/article-stream?page_size=1&page_token={}",
+            "{}{}?page_size=1&page_token={}",
             h.rest_base,
-            account_id,
+            rest_url,
             urlencode(&token)
         ))
         .header(reqwest::header::AUTHORIZATION, auth2)
@@ -1375,7 +1413,7 @@ async fn rest_notification_returns_501() {
     let ts = h.clock.now().await.unwrap();
     let auth = sign_rest_request(
         "POST",
-        "/headlines.v1.NotificationService/SendNotification",
+        "/v1/notifications",
         "",
         &body_bytes,
         sys_key_id,
@@ -1417,6 +1455,82 @@ async fn rest_notification_returns_501() {
         Cleanup {
             user_ids: vec![user_id],
             system_ids: vec![system_id],
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+// 13. Bug 2 fix: a malicious client cannot inject a `Subject` by setting
+// the trusted-subject metadata header on a direct dial of the **public**
+// gRPC listener. The public listener wraps services with `AuthInterceptor`,
+// which strips the trust header on entry — so the request resolves to
+// `Subject::Anonymous` (no Authorization either) and bounces off the
+// `AuthorizationLayer` for any non-anonymous RPC.
+#[tokio::test]
+async fn gateway_rejects_forged_trusted_subject_header_on_public_listener() {
+    skip_if_no_db!();
+
+    // Arrange — spin up the full stack and craft a tonic request that
+    // claims to be a System with `*`. We dial the **public** listener
+    // directly (not via the REST gateway), so the trusted-listener
+    // short-circuit is unreachable.
+    use headlines_auth::TRUSTED_SUBJECT_HEADER;
+    use headlines_proto::v1::TombstoneArticleRequest;
+    use headlines_proto::v1::article_service_client::ArticleServiceClient;
+
+    let h = spawn_full_stack().await;
+    // We need a real article id so the handler doesn't reject for
+    // "missing id" before AuthorizationLayer fires; doesn't matter
+    // whether it's tombstoned, the auth layer rejects first.
+    let acct_sk = make_signing_key();
+    let (account_id, _) = seed_account(&h.db, &acct_sk).await;
+    let article_id = seed_live_article(&h.db, account_id, "forge-target").await;
+
+    let endpoint = format!("http://{}", h.public_grpc_addr);
+    let channel = tonic::transport::Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .expect("must dial public gRPC");
+    let mut client = ArticleServiceClient::new(channel);
+
+    let forged = headlines_core::Subject::System {
+        system_id: Uuid::now_v7(),
+        key_id: Uuid::now_v7(),
+        scopes: vec!["*".into()],
+    };
+    let raw = serde_json::to_string(&forged).unwrap();
+    let mut req = tonic::Request::new(TombstoneArticleRequest {
+        id: article_id.to_string(),
+        reason: "forge".into(),
+    });
+    req.metadata_mut()
+        .insert(TRUSTED_SUBJECT_HEADER, raw.parse().unwrap());
+
+    // Act — fire the request directly at the public listener.
+    let res = client.tombstone_article(req).await;
+
+    // Assert — must NOT succeed; either UNAUTHENTICATED (no Authorization
+    // ever supplied so the public AuthInterceptor would have moved it on
+    // as Anonymous) or PERMISSION_DENIED (AuthorizationLayer rejecting an
+    // Anonymous subject for an account-self RPC). Either way the
+    // forged-System path must not authorise the call.
+    let err = res.expect_err("forged trust header must not authorise on public listener");
+    let code = err.code();
+    assert!(
+        matches!(
+            code,
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+        ),
+        "expected PERMISSION_DENIED or UNAUTHENTICATED, got {code:?}"
+    );
+
+    run_cleanup(
+        &h.db,
+        Cleanup {
+            account_ids: vec![account_id],
+            article_ids: vec![article_id],
             ..Default::default()
         },
     )

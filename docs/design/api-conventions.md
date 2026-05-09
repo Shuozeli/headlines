@@ -128,6 +128,55 @@ Signature key_id=<uuid>, algo=<algo>, ts=<unix>, nonce=<base64>, sig=<base64>
 
 Full canonicalization, signed payload, and replay-protection rules live in `docs/design/auth.md`. This doc only fixes the wire shape so other docs can reference it.
 
+### Worked example: signed `POST /v1/articles/{id}/tombstone`
+
+Suppose a publisher wants to tombstone an article via the REST gateway.
+
+Inputs:
+
+- HTTP method: `POST`
+- REST URL path: `/v1/articles/018f2c1f-2a02-7c3a-9d10-2cb5b6b5e0f8/tombstone`
+- Query string: empty
+- JSON body: `{"reason": "violates terms"}`
+- Translated proto request: `TombstoneArticleRequest { id = "018f2c…f8", reason = "violates terms" }`
+- `key_id`: `bd2a3a6c-2c97-49a4-9f5a-86c69ad5d3a1`
+- `algo`: `ed25519`
+- `ts`: TSO from `GetTime`, e.g. `4500000067108864`
+- `nonce`: 16 random bytes, e.g. `aGVsbG8td29ybGQtbm9uY2VyAA==` (base64)
+
+Steps:
+
+1. **Encode the proto** the gateway will forward (`canonical_proto_encode`).
+   Hash the bytes:
+   `request_hash = sha256(TombstoneArticleRequest.encode_to_vec())` →
+   hex digest, e.g. `9c3a0f...d4` (64 hex chars).
+2. **Build the canonical string** (`\n` separated, no trailing newline):
+
+   ```
+   HEADLINES-SIGN-V1
+   POST
+   /v1/articles/018f2c1f-2a02-7c3a-9d10-2cb5b6b5e0f8/tombstone
+
+   9c3a0f...d4
+   bd2a3a6c-2c97-49a4-9f5a-86c69ad5d3a1
+   4500000067108864
+   aGVsbG8td29ybGQtbm9uY2VyAA==
+   ```
+
+   (Line 4 — canonical query — is empty for this request.)
+3. **Sign**: `sig = ed25519_sign(private_key, sha256(canonical_string))`.
+4. **Header value**:
+
+   ```
+   Authorization: Signature key_id=bd2a3a6c-2c97-49a4-9f5a-86c69ad5d3a1, algo=ed25519, ts=4500000067108864, nonce=aGVsbG8td29ybGQtbm9uY2VyAA==, sig=<b64(sig)>
+   ```
+
+The gateway re-derives the same canonical string from `(method, REST URL,
+canonicalize_query(""), sha256(R.encode_to_vec()))` and verifies the
+signature before forwarding the resolved `Subject` to the trusted gRPC
+listener. See `docs/design/auth.md`'s "Gateway trust" subsection for the
+end-to-end flow.
+
 ## Field naming & types
 
 - **All proto field names: `snake_case`** (matches proto3 default).

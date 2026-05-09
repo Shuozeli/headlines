@@ -48,14 +48,20 @@ The signed string is independent of transport (gRPC binary or REST JSON):
 
 ```
 HEADLINES-SIGN-V1
-<HTTP method uppercase>            -- "POST"
-<path>                             -- "/v1/articles/{id}/tombstone"  OR  "/headlines.v1.ArticleService/TombstoneArticle"
+<HTTP method uppercase>            -- "POST", "GET", "PUT", ...
+<path>                             -- the public URL the client called
 <canonical query string>           -- sorted "k1=v1&k2=v2", empty otherwise
 <request_hash>                     -- see "Hashing strategy" below
 <key_id>
 <ts>
 <nonce>
 ```
+
+**`<path>` rule**: clients sign the URL they actually called.
+- REST clients use the **REST URL** path: e.g. `/v1/articles/{id}/tombstone`
+  (with concrete path params substituted).
+- gRPC clients dialing the public gRPC listener directly use the
+  **gRPC method path**: e.g. `/headlines.v1.ArticleService/TombstoneArticle`.
 
 `signature = sign(private_key, sha256(canonical_string))`.
 
@@ -215,6 +221,71 @@ Per-article visibility flag (private/public switch) is deferred. v1: all live ar
 `AuthorizationLayer` then consults the proto-derived `AUTH_TABLE`. If `Anonymous` is not in the RPC's `allowed` subject classes, the layer returns `PERMISSION_DENIED`.
 
 Tests asserting the anonymous-rejection surface should pin `PERMISSION_DENIED` (the `AuthorizationLayer` outcome). `UNAUTHENTICATED` is reserved for credential failures and should be asserted with a specifically malformed header.
+
+### Gateway trust
+
+REST and gRPC share the same `headlines.v1.*` services in-process. To make
+the **REST URL** signing rule above work end-to-end, we split the gRPC
+surface into two listeners and route the REST gateway through the
+"trusted" half:
+
+- **Public gRPC listener** — bound on `[server].grpc_host:grpc_port`, wrapped
+  with the signature-verifying `AuthInterceptor`. Direct gRPC clients dial
+  here and sign with the **gRPC method path**. The interceptor *strips* the
+  trusted-subject metadata header on entry — so an external client cannot
+  forge a `Subject` by setting `x-headlines-trusted-subject` themselves.
+- **Internal trusted gRPC listener** — bound on `127.0.0.1:<auto-picked>`,
+  wrapped with `TrustedSubjectInterceptor`. The REST gateway dials this
+  endpoint *only* (default `[server].rest_gateway_target = "in_process"`).
+  External clients cannot reach it (loopback only). The interceptor reads
+  `x-headlines-trusted-subject` (a JSON-encoded `Subject`), inserts the
+  `Subject` into request extensions, and skips signature verification —
+  the REST gateway has already done that work on the inbound REST request.
+
+The REST gateway flow:
+
+1. Receive an inbound REST request with method `M`, URL `U`, query `Q`,
+   JSON body `B`.
+2. Translate `B` into the gRPC request proto `R`. Hash
+   `request_hash = sha256(R.encode_to_vec())`.
+3. If the inbound `Authorization` header is present: parse it, build
+   `SignedRequestParts { method = M, path = U, canonical_query = sorted(Q),
+   request_hash, ... }`, run `SignedRequestStrategy::authenticate`. On
+   success the strategy returns a `Subject`; on failure the gateway
+   returns the appropriate REST error (401 / etc.) and never dials gRPC.
+4. If no `Authorization` header: `Subject = Anonymous`.
+5. Dial the trusted gRPC listener with `R` plus
+   `x-headlines-trusted-subject: <json(Subject)>`. Strip the original
+   `Authorization` from outgoing metadata.
+6. The trusted interceptor lifts the `Subject` into request extensions;
+   `AuthorizationLayer` runs as usual against the proto-driven
+   `AUTH_TABLE`. If `Subject` is not in `allowed`, the call gets
+   `PERMISSION_DENIED`.
+
+**Trust mechanism is per-listener**, not per-peer-address: the trust
+short-circuit lives on the layer wrapping the trusted listener. The
+public listener can never honour a trusted-subject hint because it's
+wrapped with a different interceptor that strips the header.
+
+The shared `AuthorizationLayer` runs on **both** listeners — the
+trusted-pass-through interceptor only skips *signature verification*, not
+authorization. The Subject the gateway produces still has to satisfy
+`AUTH_TABLE.allowed` for the RPC.
+
+The gateway's `SignedRequestStrategy` uses the **same** `KeyResolver`,
+`TimeSource`, `NonceStore`, and `AlgorithmRegistry` instances the gRPC
+server uses, so replay/TSO state stays single-source even when the same
+key signs both REST and direct-gRPC traffic.
+
+**Future split-process deployment.** The loopback-listener mechanism
+assumes the REST gateway and the gRPC service share a process address
+space. For a future split deployment (gateway and gRPC service on
+different hosts), upgrade the trusted channel to mTLS: only the gateway
+holds the client cert that the gRPC service trusts to assert
+`Subject::*` over the wire. The interceptor swap (`AuthInterceptor` ↔
+`TrustedSubjectInterceptor`) still selects who's listening; the only
+change is that the trusted listener moves from loopback to a TLS
+endpoint with a pinned client-cert allowlist.
 
 ### Cross-table `key_id` collision
 

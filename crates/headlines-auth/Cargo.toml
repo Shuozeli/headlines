@@ -39,6 +39,9 @@ anyhow.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 
+# --- JSON (used to ship `Subject` over the trusted-listener metadata header) ---
+serde_json.workspace = true
+
 # --- LRU + Mutex ---
 lru.workspace = true
 parking_lot.workspace = true

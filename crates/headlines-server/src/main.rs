@@ -39,7 +39,7 @@ use headlines_api::{
 use headlines_auth::{
     AlgorithmRegistry, AuthInterceptor, AuthMetrics, AuthorizationLayer, InMemoryNonceStore,
     InProcessTso, InProcessTsoConfig, LocalClock, PostgresKeyResolver, PostgresTsoStore,
-    ProtoBodyHasher, SignedRequestStrategy,
+    ProtoBodyHasher, SignedRequestStrategy, TrustedSubjectInterceptor,
 };
 use headlines_core::TimeSource;
 use headlines_proto::v1::account_service_server::AccountServiceServer;
@@ -125,173 +125,227 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&nonce_store),
     ));
 
-    // ---- AccountService ----
+    // ---- Service repos (shared Arcs across both gRPC listeners) ----
+    let account_bootstrap = parse_bootstrap_mode(&config.auth.bootstrap.account_registration)?;
+    let user_bootstrap = parse_bootstrap_mode(&config.auth.bootstrap.user_registration)?;
     let account_repo = Arc::new(headlines_store::PgAccountRepo::new(db.clone()));
     let key_repo = Arc::new(headlines_store::PgKeyRepo::new(db.clone()));
-    let account_bootstrap = parse_bootstrap_mode(&config.auth.bootstrap.account_registration)?;
-    let account_svc = AccountServiceImpl::new(
-        account_repo,
-        key_repo.clone(),
-        algos.clone(),
-        account_bootstrap,
-    );
-
-    // ---- UserService ----
     let user_repo = Arc::new(headlines_store::PgUserRepo::new(db.clone()));
-    let user_bootstrap = parse_bootstrap_mode(&config.auth.bootstrap.user_registration)?;
-    let user_svc = UserServiceImpl::new(user_repo, key_repo, algos.clone(), user_bootstrap);
-
-    // ---- ArticleService ----
-    //
-    // The Article handler holds an `Arc<dyn AccountRepo>` for the
-    // account-active precondition on Publish; it shares the same Postgres
-    // pool. `content_max_bytes` flows through `[articles]` (default in
-    // `Config::default` via the api-crate `DEFAULT_CONTENT_MAX_BYTES`).
     let article_account_repo = Arc::new(headlines_store::PgAccountRepo::new(db.clone()));
     let article_repo = Arc::new(headlines_store::PgArticleRepo::new(db.clone()));
-    let article_svc = ArticleServiceImpl::new(
-        article_account_repo,
-        article_repo,
-        config.articles.content_max_bytes,
-    )
-    .with_metrics(Arc::clone(&domain_metrics));
-
-    // ---- DraftService ----
-    //
-    // Same content cap as ArticleService — drafts must be valid articles per
-    // `drafts.md`. Holds its own `Arc<dyn AccountRepo>` so the
-    // CreateDraft / PublishDraft handlers can re-check the owning account
-    // is active. Shares `[articles].content_max_bytes` because drafts and
-    // published articles must agree on the cap.
     let draft_account_repo = Arc::new(headlines_store::PgAccountRepo::new(db.clone()));
     let draft_repo = Arc::new(headlines_store::PgDraftRepo::new(db.clone()));
-    let draft_svc = DraftServiceImpl::new(
-        draft_account_repo,
-        draft_repo,
-        config.articles.content_max_bytes,
-    )
-    .with_metrics(Arc::clone(&domain_metrics));
-
-    // ---- FollowService ----
-    //
-    // Holds its own user/account repo handles to validate the target rows
-    // before mutating the edge (`UserDeleted` / `AccountDeleted` per
-    // `follows.md`). The `FollowRepo` is a separate concrete impl over the
-    // shared pool.
     let follow_user_repo = Arc::new(headlines_store::PgUserRepo::new(db.clone()));
     let follow_account_repo = Arc::new(headlines_store::PgAccountRepo::new(db.clone()));
     let follow_repo = Arc::new(headlines_store::PgFollowRepo::new(db.clone()));
-    let follow_svc = FollowServiceImpl::new(follow_user_repo, follow_account_repo, follow_repo);
-
-    // ---- FeedRecommendationService ----
-    //
-    // System-only writer (the ranker), user-self reader. Holds its own
-    // `UserRepo` handle to enforce existence + status checks before mutating
-    // or reading the feed (per `feed-recommendation.md`).
     let feed_user_repo = Arc::new(headlines_store::PgUserRepo::new(db.clone()));
     let feed_repo = Arc::new(headlines_store::PgFeedRecommendationRepo::new(db.clone()));
-    let feed_recommendation_svc = FeedRecommendationServiceImpl::new(
-        feed_user_repo,
-        feed_repo,
-        config.feeds.replace_max_items,
-    )
-    .with_metrics(Arc::clone(&domain_metrics));
-
-    // ---- FeedFollowService ----
-    //
-    // Read-only computed feed: `follows ⨝ articles_live` ordered by
-    // `articles.created_at DESC`. User-self read or System with
-    // `feeds.follow.read`. Holds its own `UserRepo` handle for the
-    // existence + status precondition (per `feed-follow.md`).
     let feed_follow_user_repo = Arc::new(headlines_store::PgUserRepo::new(db.clone()));
     let feed_follow_repo = Arc::new(headlines_store::PgFeedFollowRepo::new(db.clone()));
-    let feed_follow_svc = FeedFollowServiceImpl::new(feed_follow_user_repo, feed_follow_repo);
-
-    // ---- AccountStreamService ----
-    //
-    // Pull-only watermark stream per account, system-only with
-    // `articles.stream`. Holds an `AccountRepo` handle for the existence +
-    // lifecycle precondition (per `account-stream.md`: the stream **closes**
-    // on account deletion).
     let account_stream_account_repo = Arc::new(headlines_store::PgAccountRepo::new(db.clone()));
     let account_stream_repo = Arc::new(headlines_store::PgAccountStreamRepo::new(db.clone()));
-    let account_stream_svc =
-        AccountStreamServiceImpl::new(account_stream_account_repo, account_stream_repo);
-
-    // ---- EventService ----
-    //
-    // Append-only user-activity log per `events.md`. Holds an `EventRepo`
-    // handle and a shared `TimeSource` (the same one used by the auth
-    // strategy) so the `occurred_at` window check is anchored to the same
-    // monotonic TSO clock the rest of the server uses. `batch_max_items`
-    // flows through `[events]` (default in `Config::default` via the api
-    // crate's `DEFAULT_EVENTS_BATCH_MAX_ITEMS`).
     let event_repo = Arc::new(headlines_store::PgEventRepo::new(db.clone()));
-    let event_svc = EventServiceImpl::new(
-        event_repo,
-        Arc::clone(&time_source),
-        config.events.batch_max_items,
-    )
-    .with_metrics(Arc::clone(&domain_metrics));
 
-    // ---- NotificationService ----
-    //
-    // Phase 7.9 reserves the surface: every RPC returns
-    // `NOT_IMPLEMENTED_IN_V1`. No repo, no time source, no storage tables.
-    // The proto-driven `AUTH_TABLE` still enforces subject + scope so a
-    // misconfigured caller is rejected with `PERMISSION_DENIED` before the
-    // handler runs. A future "delivery" doc / phase will replace this stub.
-    let notification_svc = NotificationServiceImpl::new();
+    // ---- Build the 10 services. Built once for the public listener,
+    //      then again with the same `Arc` repos for the trusted listener.
+    //      Service structs aren't `Clone`, so this is the cheapest way to
+    //      hand both `tonic::transport::Server::add_service(...)` calls a
+    //      service that owns the same shared state. ----
+    let make_account = || {
+        AccountServiceImpl::new(
+            account_repo.clone(),
+            key_repo.clone(),
+            algos.clone(),
+            account_bootstrap,
+        )
+    };
+    let make_user = || {
+        UserServiceImpl::new(
+            user_repo.clone(),
+            key_repo.clone(),
+            algos.clone(),
+            user_bootstrap,
+        )
+    };
+    let make_article = || {
+        ArticleServiceImpl::new(
+            article_account_repo.clone(),
+            article_repo.clone(),
+            config.articles.content_max_bytes,
+        )
+        .with_metrics(Arc::clone(&domain_metrics))
+    };
+    let make_draft = || {
+        DraftServiceImpl::new(
+            draft_account_repo.clone(),
+            draft_repo.clone(),
+            config.articles.content_max_bytes,
+        )
+        .with_metrics(Arc::clone(&domain_metrics))
+    };
+    let make_follow = || {
+        FollowServiceImpl::new(
+            follow_user_repo.clone(),
+            follow_account_repo.clone(),
+            follow_repo.clone(),
+        )
+    };
+    let make_feed_recommendation = || {
+        FeedRecommendationServiceImpl::new(
+            feed_user_repo.clone(),
+            feed_repo.clone(),
+            config.feeds.replace_max_items,
+        )
+        .with_metrics(Arc::clone(&domain_metrics))
+    };
+    let make_feed_follow =
+        || FeedFollowServiceImpl::new(feed_follow_user_repo.clone(), feed_follow_repo.clone());
+    let make_account_stream = || {
+        AccountStreamServiceImpl::new(
+            account_stream_account_repo.clone(),
+            account_stream_repo.clone(),
+        )
+    };
+    let make_event = || {
+        EventServiceImpl::new(
+            event_repo.clone(),
+            Arc::clone(&time_source),
+            config.events.batch_max_items,
+        )
+        .with_metrics(Arc::clone(&domain_metrics))
+    };
+    let make_notification = NotificationServiceImpl::new;
 
-    // ---- Compose tower stack ----
-    let auth_interceptor = AuthInterceptor::new(strategy, Arc::new(ProtoBodyHasher))
+    // ---- Compose tower stack pieces ----
+    let auth_interceptor = AuthInterceptor::new(Arc::clone(&strategy), Arc::new(ProtoBodyHasher))
         .with_metrics(Arc::clone(&auth_metrics));
-    let authorize = AuthorizationLayer::new();
-    let trace = tower_http::trace::TraceLayer::new_for_grpc();
-    let rpc_metrics_layer = metrics::MetricsLayer::new(Arc::clone(&rpc_metrics));
+    let trusted_interceptor = TrustedSubjectInterceptor::new();
+    let authorize_public = AuthorizationLayer::new();
+    let authorize_trusted = AuthorizationLayer::new();
+    let trace_public = tower_http::trace::TraceLayer::new_for_grpc();
+    let trace_trusted = tower_http::trace::TraceLayer::new_for_grpc();
+    let rpc_metrics_public = metrics::MetricsLayer::new(Arc::clone(&rpc_metrics));
+    let rpc_metrics_trusted = metrics::MetricsLayer::new(Arc::clone(&rpc_metrics));
 
-    // ---- gRPC server ----
+    // ---- Public gRPC listener (the one external clients dial) ----
     let grpc_addr = bind.grpc_addr;
     let grpc_shutdown = shutdown_signal();
+    let public_account = make_account();
+    let public_user = make_user();
+    let public_article = make_article();
+    let public_draft = make_draft();
+    let public_follow = make_follow();
+    let public_feed_recommendation = make_feed_recommendation();
+    let public_feed_follow = make_feed_follow();
+    let public_account_stream = make_account_stream();
+    let public_event = make_event();
+    let public_notification = make_notification();
     let grpc_handle = tokio::spawn(async move {
         let server = Server::builder()
-            .layer(trace)
-            .layer(rpc_metrics_layer)
+            .layer(trace_public)
+            .layer(rpc_metrics_public)
             .layer(auth_interceptor)
-            .layer(authorize)
-            .add_service(AccountServiceServer::new(account_svc))
-            .add_service(UserServiceServer::new(user_svc))
-            .add_service(ArticleServiceServer::new(article_svc))
-            .add_service(DraftServiceServer::new(draft_svc))
-            .add_service(FollowServiceServer::new(follow_svc))
+            .layer(authorize_public)
+            .add_service(AccountServiceServer::new(public_account))
+            .add_service(UserServiceServer::new(public_user))
+            .add_service(ArticleServiceServer::new(public_article))
+            .add_service(DraftServiceServer::new(public_draft))
+            .add_service(FollowServiceServer::new(public_follow))
             .add_service(FeedRecommendationServiceServer::new(
-                feed_recommendation_svc,
+                public_feed_recommendation,
             ))
-            .add_service(FeedFollowServiceServer::new(feed_follow_svc))
-            .add_service(AccountStreamServiceServer::new(account_stream_svc))
-            .add_service(EventServiceServer::new(event_svc))
-            .add_service(NotificationServiceServer::new(notification_svc));
-        info!(addr = %grpc_addr, "gRPC server bound");
+            .add_service(FeedFollowServiceServer::new(public_feed_follow))
+            .add_service(AccountStreamServiceServer::new(public_account_stream))
+            .add_service(EventServiceServer::new(public_event))
+            .add_service(NotificationServiceServer::new(public_notification));
+        info!(addr = %grpc_addr, "public gRPC server bound");
         if let Err(e) = server
             .serve_with_shutdown(grpc_addr, async {
                 grpc_shutdown.await;
             })
             .await
         {
-            tracing::error!(error = %e, "gRPC server exited with error");
+            tracing::error!(error = %e, "public gRPC server exited with error");
         } else {
-            info!("gRPC server stopped");
+            info!("public gRPC server stopped");
+        }
+    });
+
+    // ---- Internal trusted gRPC listener (loopback only) ----
+    //
+    // Bound on `127.0.0.1:0` so the OS picks an ephemeral port we then
+    // hand to the REST gateway. External clients cannot reach this
+    // listener; trust is conveyed by the layer wrapping it
+    // (`TrustedSubjectInterceptor`) lifting the gateway-supplied
+    // `Subject` into request extensions without verifying signatures.
+    let trusted_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("bind internal trusted gRPC listener")?;
+    trusted_listener
+        .set_nonblocking(true)
+        .context("set trusted listener nonblocking")?;
+    let trusted_addr = trusted_listener
+        .local_addr()
+        .context("query trusted listener addr")?;
+    let trusted_listener =
+        tokio::net::TcpListener::from_std(trusted_listener).context("convert std listener")?;
+    let trusted_inc = tokio_stream::wrappers::TcpListenerStream::new(trusted_listener);
+    let trusted_shutdown = shutdown_signal();
+    let trusted_account = make_account();
+    let trusted_user = make_user();
+    let trusted_article = make_article();
+    let trusted_draft = make_draft();
+    let trusted_follow = make_follow();
+    let trusted_feed_recommendation = make_feed_recommendation();
+    let trusted_feed_follow = make_feed_follow();
+    let trusted_account_stream = make_account_stream();
+    let trusted_event = make_event();
+    let trusted_notification = make_notification();
+    let trusted_handle = tokio::spawn(async move {
+        let server = Server::builder()
+            .layer(trace_trusted)
+            .layer(rpc_metrics_trusted)
+            .layer(trusted_interceptor)
+            .layer(authorize_trusted)
+            .add_service(AccountServiceServer::new(trusted_account))
+            .add_service(UserServiceServer::new(trusted_user))
+            .add_service(ArticleServiceServer::new(trusted_article))
+            .add_service(DraftServiceServer::new(trusted_draft))
+            .add_service(FollowServiceServer::new(trusted_follow))
+            .add_service(FeedRecommendationServiceServer::new(
+                trusted_feed_recommendation,
+            ))
+            .add_service(FeedFollowServiceServer::new(trusted_feed_follow))
+            .add_service(AccountStreamServiceServer::new(trusted_account_stream))
+            .add_service(EventServiceServer::new(trusted_event))
+            .add_service(NotificationServiceServer::new(trusted_notification));
+        info!(addr = %trusted_addr, "trusted (internal) gRPC server bound");
+        if let Err(e) = server
+            .serve_with_incoming_shutdown(trusted_inc, async {
+                trusted_shutdown.await;
+            })
+            .await
+        {
+            tracing::error!(error = %e, "trusted gRPC server exited with error");
+        } else {
+            info!("trusted gRPC server stopped");
         }
     });
 
     // ---- REST gateway ----
     //
-    // Wait briefly for the gRPC server to start accepting connections. We
-    // poll a short timeout rather than racing the bind.
+    // The gateway dials the **trusted** listener over loopback so the
+    // resolved `Subject` from the gateway's auth strategy short-circuits
+    // signature verification on the gRPC side.
+    //
+    // For split deployments the operator can override
+    // `[server].rest_gateway_target` with an explicit `host:port`; in that
+    // case the gateway falls back to dialing that target directly. In a
+    // split deploy the trusted-listener short-circuit doesn't apply over
+    // the network — the future mTLS upgrade path mentioned in `auth.md` is
+    // the planned solution.
     let rest_endpoint = match config.server.rest_gateway_target.as_str() {
-        "in_process" => format!("http://{}", grpc_addr),
+        "in_process" => format!("http://{}", trusted_addr),
         target => {
-            // Allow a fully-qualified URL or `host:port` for split deploys.
             if target.starts_with("http://") || target.starts_with("https://") {
                 target.to_owned()
             } else {
@@ -302,10 +356,11 @@ async fn main() -> anyhow::Result<()> {
 
     let rest_addr = bind.rest_addr;
     let rest_shutdown = shutdown_signal();
+    let rest_strategy = Arc::clone(&strategy);
     let rest_handle = tokio::spawn(async move {
-        // The gRPC server may not be listening yet; the gateway dial retries
-        // for a couple of seconds before giving up.
-        let app = match wait_for_gateway(&rest_endpoint, Duration::from_secs(5)).await {
+        let app = match wait_for_gateway(&rest_endpoint, rest_strategy, Duration::from_secs(5))
+            .await
+        {
             Ok(app) => app,
             Err(e) => {
                 tracing::error!(error = %e, "REST gateway failed to connect to gRPC channel; REST disabled");
@@ -332,9 +387,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Wait for both surfaces to finish (Ctrl-C triggers shutdown_signal which
-    // unblocks both servers concurrently).
-    let _ = tokio::join!(grpc_handle, rest_handle);
+    // Wait for all three surfaces to finish (Ctrl-C / SIGTERM trigger
+    // shutdown_signal which unblocks each server concurrently).
+    let _ = tokio::join!(grpc_handle, trusted_handle, rest_handle);
     info!("headlines-server shutdown complete");
 
     Ok(())
@@ -373,11 +428,15 @@ async fn shutdown_signal() {
 
 /// Try to dial the upstream gRPC channel for up to `timeout`, returning
 /// the built REST router on success.
-async fn wait_for_gateway(endpoint: &str, timeout: Duration) -> anyhow::Result<axum::Router> {
+async fn wait_for_gateway(
+    endpoint: &str,
+    strategy: Arc<SignedRequestStrategy>,
+    timeout: Duration,
+) -> anyhow::Result<axum::Router> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
     while tokio::time::Instant::now() < deadline {
-        match headlines_rest_gateway::build_app(endpoint).await {
+        match headlines_rest_gateway::build_app(endpoint, strategy.clone()).await {
             Ok(app) => return Ok(app),
             Err(e) => {
                 last_err = Some(e);

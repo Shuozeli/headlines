@@ -450,3 +450,36 @@ resolved in the original sub-phase. Pattern: `- [<phase>] <issue> — <follow-up
   `docs/design/accounts.md`, `docs/design/articles.md`,
   `docs/design/drafts.md` validation tables now annotate each row with
   **chars** vs **bytes**.
+- [fix-bug2] [v1-review/bug2] REST clients had to sign with the **gRPC
+  fully-qualified method path** (e.g.
+  `/headlines.v1.AccountService/CreateAccount`) instead of the **REST
+  URL** because the gateway forwarded the inbound `Authorization`
+  header verbatim and the gRPC `AuthInterceptor` re-derived the
+  canonical string from the gRPC path it saw. Fix (Position A): the
+  REST gateway now runs `SignedRequestStrategy` on the inbound REST
+  request (canonical built from REST URL) and forwards the resolved
+  `Subject` to a **trusted** in-process gRPC listener via the
+  `x-headlines-trusted-subject` metadata header. The trusted listener
+  is bound on `127.0.0.1:<auto>` and wrapped with
+  `TrustedSubjectInterceptor`, which lifts the `Subject` into request
+  extensions and skips signature verification. The **public** listener
+  is bound on `[server].grpc_host:grpc_port` and still wrapped with
+  the signature-verifying `AuthInterceptor`, which strips the
+  trusted-subject header on entry to prevent forgery. The
+  `AuthorizationLayer` runs on both listeners. Same `KeyResolver` /
+  `TimeSource` / `NonceStore` / `AlgorithmRegistry` instances are
+  shared across the gateway-side strategy and the public listener so
+  replay/TSO state stays single-source. Tests:
+  `rest_create_account_signed_path` (now asserts REST-URL signing
+  passes), `gateway_rejects_forged_trusted_subject_header_on_public_listener`
+  (forged System subject on the public surface is rejected), plus
+  four `TrustedSubjectInterceptor` /
+  `AuthInterceptor.strip_trusted_header` unit tests in
+  `crates/headlines-auth/src/interceptor.rs` and three
+  `attach_auth` unit tests in
+  `crates/headlines-rest-gateway/src/lib.rs`. Docs:
+  `docs/design/auth.md` "Canonicalization" pinned to "the public URL
+  the client called" and a new "Gateway trust" subsection covers the
+  loopback-listener mechanism + future mTLS upgrade path;
+  `docs/design/api-conventions.md` adds a worked
+  `POST /v1/articles/{id}/tombstone` example.

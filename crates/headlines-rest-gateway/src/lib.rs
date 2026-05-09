@@ -9,8 +9,27 @@
 //! `headlines-proto` and tweaking the build script; for the modest number of
 //! routes the manual converter is a smaller change with a smaller blast
 //! radius. Phase 7 may revisit if the per-route boilerplate gets painful.
+//!
+//! ## Authentication (REST)
+//!
+//! The gateway runs the **full** `SignedRequestStrategy` against every
+//! inbound REST request whose `Authorization` header is present, with the
+//! canonical built off the **REST URL** (so clients sign the URL they
+//! actually called, not a downstream gRPC path). On success it forwards
+//! the resolved `Subject` to the trusted in-process gRPC listener via
+//! `headlines_auth::TRUSTED_SUBJECT_HEADER`, then strips the inbound
+//! `Authorization` so it never escapes the gateway. The gRPC service on
+//! the trusted listener uses
+//! `headlines_auth::TrustedSubjectInterceptor` to lift the subject into
+//! request extensions for `AuthorizationLayer`.
+//!
+//! Anonymous-allowed REST routes (no `Authorization` header) get
+//! `Subject::Anonymous` propagated the same way; `AuthorizationLayer`
+//! consults the proto-driven `AUTH_TABLE` to allow or deny.
 
 pub mod error;
+
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -20,7 +39,13 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::{delete as axum_delete, get, patch, post, put};
 use chrono::{TimeZone, Utc};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
+
+use headlines_auth::{
+    SignedRequestStrategy, TRUSTED_SUBJECT_HEADER, canonicalize_query, parse_authorization_header,
+};
+use headlines_core::{AuthError, AuthStrategy as _, SignedRequestParts, Subject};
 
 use headlines_proto::v1::AccountStatus;
 use headlines_proto::v1::ArticleState;
@@ -54,6 +79,10 @@ pub struct GatewayState {
     pub account_stream_client: AccountStreamServiceClient<Channel>,
     pub event_client: EventServiceClient<Channel>,
     pub notification_client: NotificationServiceClient<Channel>,
+    /// Same `SignedRequestStrategy` instance the gRPC server uses on its
+    /// public listener (shared `KeyResolver` / `TimeSource` / `NonceStore`
+    /// /  `AlgorithmRegistry`). Replay state stays single-source.
+    pub auth_strategy: Arc<SignedRequestStrategy>,
 }
 
 /// Build the axum router with all REST routes wired to the upstream gRPC
@@ -61,8 +90,15 @@ pub struct GatewayState {
 ///
 /// `grpc_endpoint` must include the scheme — e.g. `http://127.0.0.1:50051`.
 /// The returned router takes ownership of one cloned channel per upstream
-/// service client.
-pub async fn build_app(grpc_endpoint: &str) -> anyhow::Result<Router> {
+/// service client. `auth_strategy` is the shared
+/// [`SignedRequestStrategy`] the gateway runs against inbound REST
+/// requests; it must point at the same `KeyResolver` / `TimeSource` /
+/// `NonceStore` / `AlgorithmRegistry` instances the public gRPC server
+/// uses, so replay/TSO state stays single-source.
+pub async fn build_app(
+    grpc_endpoint: &str,
+    auth_strategy: Arc<SignedRequestStrategy>,
+) -> anyhow::Result<Router> {
     let channel = Channel::from_shared(grpc_endpoint.to_owned())?
         .connect()
         .await?;
@@ -87,6 +123,7 @@ pub async fn build_app(grpc_endpoint: &str) -> anyhow::Result<Router> {
         account_stream_client,
         event_client,
         notification_client,
+        auth_strategy,
     }))
 }
 
@@ -186,6 +223,8 @@ fn build_router(state: GatewayState) -> Router {
 /// public_key } }`. Mirrors the `POST /v1/users` handler.
 async fn create_account(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
@@ -211,7 +250,15 @@ async fn create_account(
         author_url,
         initial_key,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.account_client.create_account(req).await?.into_inner();
     Ok(Json(json!({
         "account": resp.account.as_ref().map(account_to_json),
@@ -222,11 +269,21 @@ async fn create_account(
 /// `GET /v1/accounts/{id}` — forwards to `AccountService.GetAccount`.
 async fn get_account(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::GetAccountRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.account_client.get_account(req).await?;
     Ok(Json(account_to_json(&resp.into_inner())))
 }
@@ -238,6 +295,8 @@ async fn get_account(
 /// `POST /v1/users` — forwards to `UserService.CreateUser`.
 async fn create_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
@@ -251,7 +310,15 @@ async fn create_user(
         display_name,
         initial_key,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.create_user(req).await?.into_inner();
     Ok(Json(json!({
         "user": resp.user.as_ref().map(user_to_json),
@@ -262,11 +329,21 @@ async fn create_user(
 /// `GET /v1/users/{id}` — forwards to `UserService.GetUser`.
 async fn get_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::GetUserRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.get_user(req).await?;
     Ok(Json(user_to_json(&resp.into_inner())))
 }
@@ -277,6 +354,8 @@ async fn get_user(
 /// path) plus an optional `update_mask` carrying a `paths` string array.
 async fn update_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -298,7 +377,15 @@ async fn update_user(
         user: Some(user),
         update_mask,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.update_user(req).await?;
     Ok(Json(user_to_json(&resp.into_inner())))
 }
@@ -306,11 +393,21 @@ async fn update_user(
 /// `DELETE /v1/users/{id}` — forwards to `UserService.DeleteUser`.
 async fn delete_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::DeleteUserRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.delete_user(req).await?;
     Ok(Json(user_to_json(&resp.into_inner())))
 }
@@ -318,13 +415,23 @@ async fn delete_user(
 /// `POST /v1/users/{id}/keys` — forwards to `UserService.AddUserKey`.
 async fn add_user_key(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let key = body.get("key").map(parse_public_key);
     let mut req = tonic::Request::new(headlines_proto::v1::AddUserKeyRequest { user_id: id, key });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.add_user_key(req).await?;
     Ok(Json(user_key_to_json(&resp.into_inner())))
 }
@@ -333,6 +440,8 @@ async fn add_user_key(
 /// `UserService.RevokeUserKey`.
 async fn revoke_user_key(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((id, key_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
@@ -340,7 +449,15 @@ async fn revoke_user_key(
         user_id: id,
         key_id,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.user_client.revoke_user_key(req).await?;
     Ok(Json(user_key_to_json(&resp.into_inner())))
 }
@@ -373,14 +490,95 @@ fn parse_field_mask(v: &Value) -> prost_types::FieldMask {
     prost_types::FieldMask { paths }
 }
 
-/// Copy the inbound `Authorization` header onto the outbound tonic metadata.
-fn forward_authorization<M>(headers: &HeaderMap, req: &mut tonic::Request<M>) {
-    if let Some(value) = headers.get(http::header::AUTHORIZATION)
-        && let Ok(s) = value.to_str()
-        && let Ok(meta) = s.parse::<tonic::metadata::MetadataValue<_>>()
-    {
-        req.metadata_mut().insert("authorization", meta);
-    }
+/// Map an `AuthError` into a `GatewayError` so the gateway emits the right
+/// REST envelope on credential failure. All variants surface as HTTP 401
+/// (`UNAUTHENTICATED`) per `docs/design/api-conventions.md` — strategies
+/// never produce `INTERNAL` (internal failures get wrapped at the strategy
+/// boundary).
+fn auth_err_to_gateway_err(e: AuthError) -> GatewayError {
+    GatewayError::from(tonic::Status::unauthenticated(e.to_string()))
+}
+
+/// Run the gateway-side auth strategy on the inbound REST request and
+/// attach the resolved `Subject` to the outbound tonic request via
+/// `TRUSTED_SUBJECT_HEADER`. Strips the inbound `Authorization` from the
+/// outbound metadata — the trusted listener doesn't need it (the subject
+/// is already resolved) and we never want to forward a credential past
+/// the gateway boundary.
+///
+/// Behavior:
+///
+/// - **Authorization present**: parse the header, build canonical-string
+///   inputs from `(method, rest_path, canonical_query)`, encode the proto
+///   message and SHA-256 the bytes (matches the client's
+///   `hash_proto_request`), run `SignedRequestStrategy::authenticate`. On
+///   success forward `Subject::*`. On failure return 401.
+/// - **Authorization absent**: forward `Subject::Anonymous`. The
+///   downstream `AuthorizationLayer` consults the proto-driven
+///   `AUTH_TABLE` to allow or deny.
+async fn attach_auth<M: prost::Message>(
+    method: &str,
+    rest_path: &str,
+    raw_query: &str,
+    headers: &HeaderMap,
+    req: &mut tonic::Request<M>,
+    strategy: &SignedRequestStrategy,
+) -> Result<(), GatewayError> {
+    let subject = match headers.get(http::header::AUTHORIZATION) {
+        None => Subject::Anonymous,
+        Some(value) => {
+            let raw = value
+                .to_str()
+                .map_err(|_| {
+                    GatewayError::from(tonic::Status::unauthenticated(
+                        "malformed_authorization_header",
+                    ))
+                })?
+                .to_owned();
+            let parsed = parse_authorization_header(&raw).map_err(|_| {
+                GatewayError::from(tonic::Status::unauthenticated(
+                    "malformed_authorization_header",
+                ))
+            })?;
+
+            // Hash the canonical proto encoding the gateway will forward.
+            // Mirrors `headlines_auth::hash_proto_request` byte-for-byte;
+            // the client signs over the same hash so verification matches.
+            let proto_bytes = req.get_ref().encode_to_vec();
+            let request_hash: [u8; 32] = Sha256::digest(&proto_bytes).into();
+
+            let parts = SignedRequestParts {
+                method: method.to_owned(),
+                path: rest_path.to_owned(),
+                canonical_query: canonicalize_query(raw_query),
+                request_hash,
+                key_id: parsed.key_id,
+                algo: parsed.algo,
+                ts: parsed.ts,
+                nonce: parsed.nonce,
+                signature: parsed.signature,
+            };
+            strategy
+                .authenticate(&parts)
+                .await
+                .map_err(auth_err_to_gateway_err)?
+        }
+    };
+
+    let json = serde_json::to_string(&subject).map_err(|e| {
+        GatewayError::from(tonic::Status::internal(format!(
+            "subject serialization failed: {e}"
+        )))
+    })?;
+    let meta_value: tonic::metadata::MetadataValue<_> = json.parse().map_err(|_| {
+        GatewayError::from(tonic::Status::internal("subject metadata encode failed"))
+    })?;
+    req.metadata_mut()
+        .insert(TRUSTED_SUBJECT_HEADER, meta_value);
+    // Defense in depth: if anything ever inserted an outgoing
+    // `authorization` metadata above us, scrub it now.
+    req.metadata_mut().remove("authorization");
+    Ok(())
 }
 
 /// Hand-rolled `Account → JSON` converter. Field names are `snake_case`
@@ -462,6 +660,8 @@ fn timestamp_to_rfc3339(ts: &prost_types::Timestamp) -> String {
 /// `ArticleService.PublishArticle`.
 async fn publish_article(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -490,7 +690,15 @@ async fn publish_article(
         author_url,
         content,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.article_client.publish_article(req).await?;
     Ok(Json(article_to_json(&resp.into_inner())))
 }
@@ -498,11 +706,21 @@ async fn publish_article(
 /// `GET /v1/articles/{id}` — forwards to `ArticleService.GetArticle`.
 async fn get_article_handler(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::GetArticleRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.article_client.get_article(req).await?;
     Ok(Json(article_to_json(&resp.into_inner())))
 }
@@ -511,6 +729,8 @@ async fn get_article_handler(
 /// `ArticleService.ListAccountArticles`.
 async fn list_account_articles(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -530,7 +750,15 @@ async fn list_account_articles(
         page_token,
         include_tombstoned,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .article_client
         .list_account_articles(req)
@@ -545,6 +773,8 @@ async fn list_account_articles(
 /// `PATCH /v1/articles/{id}` — forwards to `ArticleService.EditArticle`.
 async fn edit_article(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -580,7 +810,15 @@ async fn edit_article(
         edit,
         update_mask,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.article_client.edit_article(req).await?;
     Ok(Json(article_to_json(&resp.into_inner())))
 }
@@ -589,6 +827,8 @@ async fn edit_article(
 /// `ArticleService.TombstoneArticle`.
 async fn tombstone_article(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -599,7 +839,15 @@ async fn tombstone_article(
         .unwrap_or_default()
         .to_owned();
     let mut req = tonic::Request::new(headlines_proto::v1::TombstoneArticleRequest { id, reason });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.article_client.tombstone_article(req).await?;
     Ok(Json(article_to_json(&resp.into_inner())))
 }
@@ -608,6 +856,8 @@ async fn tombstone_article(
 /// `ArticleService.RedactArticleVersion`.
 async fn redact_article_version(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((article_id, version)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -625,7 +875,15 @@ async fn redact_article_version(
         version: v,
         redaction_reason,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     state.article_client.redact_article_version(req).await?;
     Ok(Json(json!({})))
 }
@@ -822,6 +1080,8 @@ fn parse_node(v: &Value) -> headlines_proto::v1::Node {
 /// `DraftService.CreateDraft`.
 async fn create_draft(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -850,7 +1110,15 @@ async fn create_draft(
         author_url,
         content,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.draft_client.create_draft(req).await?;
     Ok(Json(draft_to_json(&resp.into_inner())))
 }
@@ -858,11 +1126,21 @@ async fn create_draft(
 /// `GET /v1/drafts/{id}` — forwards to `DraftService.GetDraft`.
 async fn get_draft(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::GetDraftRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.draft_client.get_draft(req).await?;
     Ok(Json(draft_to_json(&resp.into_inner())))
 }
@@ -872,6 +1150,8 @@ async fn get_draft(
 /// Body shape mirrors the proto: `{ "draft": { ... }, "update_mask": { "paths": [...] } }`.
 async fn update_draft(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -907,7 +1187,15 @@ async fn update_draft(
     let update_mask = body.get("update_mask").map(parse_field_mask);
     let mut req =
         tonic::Request::new(headlines_proto::v1::UpdateDraftRequest { draft, update_mask });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.draft_client.update_draft(req).await?;
     Ok(Json(draft_to_json(&resp.into_inner())))
 }
@@ -915,11 +1203,21 @@ async fn update_draft(
 /// `DELETE /v1/drafts/{id}` — forwards to `DraftService.DeleteDraft`.
 async fn delete_draft(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::DeleteDraftRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     state.draft_client.delete_draft(req).await?;
     Ok(Json(json!({})))
 }
@@ -928,6 +1226,8 @@ async fn delete_draft(
 /// `DraftService.ListAccountDrafts`.
 async fn list_account_drafts(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -942,7 +1242,15 @@ async fn list_account_drafts(
         page_size,
         page_token,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .draft_client
         .list_account_drafts(req)
@@ -957,11 +1265,21 @@ async fn list_account_drafts(
 /// `POST /v1/drafts/{id}/publish` — forwards to `DraftService.PublishDraft`.
 async fn publish_draft(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::PublishDraftRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.draft_client.publish_draft(req).await?;
     Ok(Json(article_to_json(&resp.into_inner())))
 }
@@ -1004,6 +1322,8 @@ pub fn draft_summary_to_json(s: &headlines_proto::v1::DraftSummary) -> Value {
 /// `POST /v1/users/{user_id}/follows` — forwards to `FollowService.Follow`.
 async fn follow_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -1017,7 +1337,15 @@ async fn follow_user(
         user_id,
         account_id,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.follow_client.follow(req).await?;
     Ok(Json(follow_to_json(&resp.into_inner())))
 }
@@ -1026,6 +1354,8 @@ async fn follow_user(
 /// `FollowService.Unfollow`.
 async fn unfollow_user(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((user_id, account_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
@@ -1033,7 +1363,15 @@ async fn unfollow_user(
         user_id,
         account_id,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.follow_client.unfollow(req).await?;
     Ok(Json(follow_to_json(&resp.into_inner())))
 }
@@ -1042,6 +1380,8 @@ async fn unfollow_user(
 /// `FollowService.GetFollow`.
 async fn get_follow(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((user_id, account_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
@@ -1049,7 +1389,15 @@ async fn get_follow(
         user_id,
         account_id,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.follow_client.get_follow(req).await?;
     Ok(Json(follow_to_json(&resp.into_inner())))
 }
@@ -1058,6 +1406,8 @@ async fn get_follow(
 /// `FollowService.ListUserFollows`.
 async fn list_user_follows(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1077,7 +1427,15 @@ async fn list_user_follows(
         page_token,
         include_unfollowed,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .follow_client
         .list_user_follows(req)
@@ -1093,6 +1451,8 @@ async fn list_user_follows(
 /// `FollowService.ListAccountFollowers`.
 async fn list_account_followers(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1112,7 +1472,15 @@ async fn list_account_followers(
         page_token,
         include_unfollowed,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .follow_client
         .list_account_followers(req)
@@ -1151,6 +1519,8 @@ fn follow_status_str(value: i32) -> &'static str {
 /// `FeedRecommendationService.ReplaceRecommendationFeed`.
 async fn replace_recommendation_feed(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -1168,7 +1538,15 @@ async fn replace_recommendation_feed(
         user_id,
         article_ids,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .feed_recommendation_client
         .replace_recommendation_feed(req)
@@ -1183,6 +1561,8 @@ async fn replace_recommendation_feed(
 /// `FeedRecommendationService.GetRecommendationFeed`.
 async fn get_recommendation_feed(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1197,7 +1577,15 @@ async fn get_recommendation_feed(
         page_size,
         page_token,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .feed_recommendation_client
         .get_recommendation_feed(req)
@@ -1226,6 +1614,8 @@ pub fn feed_item_to_json(item: &headlines_proto::v1::FeedItem) -> Value {
 /// `FeedFollowService.GetFollowFeed`.
 async fn get_follow_feed(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1240,7 +1630,15 @@ async fn get_follow_feed(
         page_size,
         page_token,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .feed_follow_client
         .get_follow_feed(req)
@@ -1269,6 +1667,8 @@ pub fn follow_feed_item_to_json(item: &headlines_proto::v1::FollowFeedItem) -> V
 /// `AccountStreamService.StreamAccountArticles`.
 async fn stream_account_articles(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1283,7 +1683,15 @@ async fn stream_account_articles(
         page_size,
         page_token,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .account_stream_client
         .stream_account_articles(req)
@@ -1311,12 +1719,22 @@ pub fn account_stream_item_to_json(item: &headlines_proto::v1::AccountStreamItem
 /// `POST /v1/events` — forwards to `EventService.RecordEvent`.
 async fn record_event(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let req = parse_record_event_request(&body);
     let mut tonic_req = tonic::Request::new(req);
-    forward_authorization(&headers, &mut tonic_req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut tonic_req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.event_client.record_event(tonic_req).await?;
     Ok(Json(event_to_json(&resp.into_inner())))
 }
@@ -1324,6 +1742,8 @@ async fn record_event(
 /// `POST /v1/events:batch` — forwards to `EventService.RecordEventBatch`.
 async fn record_event_batch(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
@@ -1333,7 +1753,15 @@ async fn record_event_batch(
         .map(|arr| arr.iter().map(parse_record_event_request).collect())
         .unwrap_or_default();
     let mut req = tonic::Request::new(headlines_proto::v1::RecordEventBatchRequest { events });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state
         .event_client
         .record_event_batch(req)
@@ -1350,6 +1778,8 @@ async fn record_event_batch(
 /// `received_before`, `page_size`, `page_token`.
 async fn list_events(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     axum::extract::Query(qs): axum::extract::Query<Vec<(String, String)>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
@@ -1387,7 +1817,15 @@ async fn list_events(
         received_after,
         received_before,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let resp = state.event_client.list_events(req).await?.into_inner();
     Ok(Json(json!({
         "items": resp.items.iter().map(event_to_json).collect::<Vec<_>>(),
@@ -1597,12 +2035,22 @@ fn event_properties_to_json(p: &Option<headlines_proto::v1::event::Properties>) 
 /// `POST /v1/notifications` — forwards to `NotificationService.SendNotification`.
 async fn send_notification(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let req = parse_send_notification_request(&body);
     let mut tonic_req = tonic::Request::new(req);
-    forward_authorization(&headers, &mut tonic_req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut tonic_req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .send_notification(tonic_req)
@@ -1616,6 +2064,8 @@ async fn send_notification(
 /// `NotificationService.SendNotificationBatch`.
 async fn send_notification_batch(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
@@ -1626,7 +2076,15 @@ async fn send_notification_batch(
         .unwrap_or_default();
     let mut req =
         tonic::Request::new(headlines_proto::v1::SendNotificationBatchRequest { notifications });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .send_notification_batch(req)
@@ -1638,6 +2096,8 @@ async fn send_notification_batch(
 /// `NotificationService.ListUserNotifications`.
 async fn list_user_notifications(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     axum::extract::Query(qs): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -1654,7 +2114,15 @@ async fn list_user_notifications(
         page_token,
         unread_only,
     });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .list_user_notifications(req)
@@ -1666,11 +2134,21 @@ async fn list_user_notifications(
 /// `NotificationService.MarkNotificationRead`.
 async fn mark_notification_read(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req = tonic::Request::new(headlines_proto::v1::MarkNotificationReadRequest { id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .mark_notification_read(req)
@@ -1682,12 +2160,22 @@ async fn mark_notification_read(
 /// `NotificationService.MarkAllUserNotificationsRead`.
 async fn mark_all_user_notifications_read(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req =
         tonic::Request::new(headlines_proto::v1::MarkAllUserNotificationsReadRequest { user_id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .mark_all_user_notifications_read(req)
@@ -1699,12 +2187,22 @@ async fn mark_all_user_notifications_read(
 /// `NotificationService.GetUserNotificationPreferences`.
 async fn get_user_notification_preferences(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let mut req =
         tonic::Request::new(headlines_proto::v1::GetUserNotificationPreferencesRequest { user_id });
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .get_user_notification_preferences(req)
@@ -1716,6 +2214,8 @@ async fn get_user_notification_preferences(
 /// `NotificationService.UpdateUserNotificationPreferences`.
 async fn update_user_notification_preferences(
     State(mut state): State<GatewayState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -1737,7 +2237,15 @@ async fn update_user_notification_preferences(
             update_mask,
         },
     );
-    forward_authorization(&headers, &mut req);
+    attach_auth(
+        method.as_str(),
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        &mut req,
+        &state.auth_strategy,
+    )
+    .await?;
     let _ = state
         .notification_client
         .update_user_notification_preferences(req)
@@ -1986,37 +2494,86 @@ mod tests {
         assert!(s.starts_with("1970-01-01T00:00:00"));
     }
 
-    #[test]
-    fn forward_authorization_copies_header_to_metadata() {
-        // Arrange
+    /// Build a minimal `SignedRequestStrategy` so the unit tests can run
+    /// `attach_auth` without spinning up Postgres. Uses an empty resolver
+    /// (the strategy is only invoked on the malformed-header / anonymous
+    /// paths in these tests) and a `LocalClock` time source.
+    fn build_test_strategy() -> Arc<SignedRequestStrategy> {
+        use headlines_auth::{
+            AlgorithmRegistry, Ed25519, InMemoryKeyResolver, InMemoryNonceStore, LocalClock,
+        };
+        let resolver = Arc::new(InMemoryKeyResolver::new());
+        let algos = Arc::new(AlgorithmRegistry::new().with(Box::new(Ed25519)));
+        let clock = Arc::new(LocalClock::default());
+        let nonces = Arc::new(InMemoryNonceStore::new());
+        Arc::new(SignedRequestStrategy::new(resolver, algos, clock, nonces))
+    }
+
+    #[tokio::test]
+    async fn attach_auth_with_no_authorization_forwards_anonymous_subject() {
+        // Arrange — no Authorization header at all; gateway should attach
+        // `Subject::Anonymous` so AuthorizationLayer can decide.
+        let strategy = build_test_strategy();
+        let headers = HeaderMap::new();
+        let mut req =
+            tonic::Request::new(headlines_proto::v1::GetAccountRequest { id: "abc".into() });
+
+        // Act
+        attach_auth("GET", "/v1/accounts/abc", "", &headers, &mut req, &strategy)
+            .await
+            .expect("anonymous attach must succeed");
+
+        // Assert — outbound metadata carries the trust header with an
+        // Anonymous subject; no `authorization` metadata leaks downstream.
+        let trust = req
+            .metadata()
+            .get(TRUSTED_SUBJECT_HEADER)
+            .expect("trust header present");
+        let subj: Subject = serde_json::from_str(trust.to_str().unwrap()).unwrap();
+        assert_eq!(subj, Subject::Anonymous);
+        assert!(req.metadata().get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_auth_with_malformed_authorization_returns_401() {
+        // Arrange — header doesn't start with `Signature`; gateway must
+        // refuse rather than passing the request through.
+        let strategy = build_test_strategy();
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
-            "Signature key_id=00000000-0000-0000-0000-000000000000, algo=ed25519, ts=1, nonce=AA==, sig=AA=="
-                .parse()
-                .unwrap(),
+            "Bearer not-our-format".parse().unwrap(),
         );
-        let mut req = tonic::Request::new(());
+        let mut req =
+            tonic::Request::new(headlines_proto::v1::GetAccountRequest { id: "abc".into() });
 
         // Act
-        forward_authorization(&headers, &mut req);
+        let res = attach_auth("GET", "/v1/accounts/abc", "", &headers, &mut req, &strategy).await;
 
         // Assert
-        let got = req
-            .metadata()
-            .get("authorization")
-            .expect("authorization metadata present");
-        assert!(got.to_str().unwrap().starts_with("Signature key_id="));
+        let err = res.expect_err("malformed header must surface as GatewayError");
+        match err {
+            GatewayError::Grpc(s) => assert_eq!(s.code(), tonic::Code::Unauthenticated),
+            other => panic!("expected Grpc(Unauthenticated), got {other:?}"),
+        }
     }
 
-    #[test]
-    fn forward_authorization_is_a_noop_without_header() {
-        // Arrange
+    #[tokio::test]
+    async fn attach_auth_strips_inbound_authorization_metadata() {
+        // Arrange — caller pre-populated outgoing `authorization` metadata
+        // (defense-in-depth). Even on the anonymous path, gateway must not
+        // forward an `authorization` to the gRPC service.
+        let strategy = build_test_strategy();
         let headers = HeaderMap::new();
-        let mut req = tonic::Request::new(());
+        let mut req =
+            tonic::Request::new(headlines_proto::v1::GetAccountRequest { id: "abc".into() });
+        req.metadata_mut()
+            .insert("authorization", "leftover".parse().unwrap());
 
         // Act
-        forward_authorization(&headers, &mut req);
+        attach_auth("GET", "/v1/accounts/abc", "", &headers, &mut req, &strategy)
+            .await
+            .unwrap();
 
         // Assert
         assert!(req.metadata().get("authorization").is_none());

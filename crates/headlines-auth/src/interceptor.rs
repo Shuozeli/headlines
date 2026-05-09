@@ -15,6 +15,26 @@
 //! Tests that exercise the canonicalization without going through tonic's
 //! frame layer can fall back to `NoopBodyHasher` (returns 32 zero bytes —
 //! signers and verifiers must use the same hash for the round-trip to work).
+//!
+//! ## Trusted-subject pass-through (gateway → in-process gRPC)
+//!
+//! The REST gateway runs the full auth strategy on inbound REST requests
+//! (with the canonical built off the **REST URL**), then forwards the
+//! resolved `Subject` to the gRPC service over a *trusted listener* via the
+//! [`TRUSTED_SUBJECT_HEADER`] metadata key (JSON-encoded `Subject`). The
+//! gRPC service is wrapped on that listener with [`TrustedSubjectInterceptor`]
+//! which:
+//!
+//! - Deserializes the header into a `Subject`.
+//! - Inserts the `Subject` into request extensions for the
+//!   `AuthorizationLayer` downstream.
+//! - Skips signature verification.
+//!
+//! Trust is conveyed by *which interceptor wraps the service*, not by
+//! peer-address inspection — the public gRPC listener uses
+//! [`AuthInterceptor`], which **strips** the trusted-subject header before
+//! anything else, so a malicious external client cannot inject a forged
+//! `Subject`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,6 +52,12 @@ use headlines_core::{AuthError, AuthStrategy, SignedRequestParts, Subject};
 
 use crate::metrics::AuthMetrics;
 use crate::strategy::{canonicalize_query, parse_authorization_header};
+
+/// HTTP/gRPC header name used by the REST gateway to convey a pre-resolved
+/// `Subject` over the in-process **trusted** loopback gRPC listener. The
+/// value is a JSON-encoded `Subject`. The public listener strips this
+/// header on entry so an external client cannot forge a Subject.
+pub const TRUSTED_SUBJECT_HEADER: &str = "x-headlines-trusted-subject";
 
 /// Errors a `BodyHasher` may surface.
 ///
@@ -213,6 +239,14 @@ where
         let metrics = self.metrics.clone();
 
         Box::pin(async move {
+            // Strip any client-supplied `x-headlines-trusted-subject` header
+            // before we look at anything else. The public gRPC listener must
+            // never honor a trusted-subject hint — that path is reserved for
+            // the in-process REST gateway over the trusted loopback listener
+            // (see `TrustedSubjectInterceptor`). Failing to strip here would
+            // let an external attacker mint any `Subject` they wanted.
+            req.headers_mut().remove(TRUSTED_SUBJECT_HEADER);
+
             let header_val = req
                 .headers()
                 .get(http::header::AUTHORIZATION)
@@ -314,6 +348,102 @@ where
 fn unauth_response(msg: &str) -> http::Response<BoxBody> {
     let status = tonic::Status::unauthenticated(msg.to_owned());
     status.into_http()
+}
+
+// ---------------------------------------------------------------------------
+// Trusted-subject pass-through interceptor
+// ---------------------------------------------------------------------------
+
+/// `tower::Layer` used on the **internal trusted** gRPC listener. The REST
+/// gateway dials this listener after running its own auth strategy against
+/// the inbound REST request; it forwards the resolved `Subject` via the
+/// [`TRUSTED_SUBJECT_HEADER`] metadata key (JSON encoding).
+///
+/// This interceptor does **not** verify signatures. It simply:
+///
+/// 1. Reads the `x-headlines-trusted-subject` header.
+/// 2. JSON-deserializes the payload into a `Subject`.
+/// 3. Inserts the `Subject` into request extensions for `AuthorizationLayer`.
+///
+/// A request with no trust header — or a malformed one — is rejected with
+/// `UNAUTHENTICATED`. The gateway is required to populate the header for
+/// every forwarded RPC, including anonymous ones (`Subject::Anonymous`).
+///
+/// Trust is conveyed by binding this layer only to a loopback / Unix socket
+/// listener that external clients cannot reach. The public listener uses
+/// [`AuthInterceptor`] (which strips this header) so a forged
+/// trusted-subject header never escapes the in-process gateway path.
+#[derive(Clone, Default)]
+pub struct TrustedSubjectInterceptor;
+
+impl TrustedSubjectInterceptor {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> Layer<S> for TrustedSubjectInterceptor {
+    type Service = TrustedSubjectInterceptorService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrustedSubjectInterceptorService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct TrustedSubjectInterceptorService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request<BoxBody>> for TrustedSubjectInterceptorService<S>
+where
+    S: Service<Request<BoxBody>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    type Response = http::Response<BoxBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<BoxBody>) -> Self::Future {
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+
+        Box::pin(async move {
+            let raw = match req.headers().get(TRUSTED_SUBJECT_HEADER) {
+                Some(v) => match v.to_str() {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => {
+                        return Ok(unauth_response("malformed_trusted_subject_header"));
+                    }
+                },
+                None => {
+                    // The gateway must always populate the trust header,
+                    // even for anonymous calls. Missing header on the
+                    // trusted listener is a misconfiguration — refuse.
+                    return Ok(unauth_response("missing_trusted_subject_header"));
+                }
+            };
+
+            let subject: Subject = match serde_json::from_str(&raw) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Ok(unauth_response("malformed_trusted_subject_header"));
+                }
+            };
+
+            // Strip the header on the way in so it doesn't accidentally
+            // leak further (e.g. into structured logs of the inner
+            // service).
+            req.headers_mut().remove(TRUSTED_SUBJECT_HEADER);
+            req.extensions_mut().insert(subject);
+            inner.call(req).await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -714,5 +844,105 @@ mod tests {
             (tonic::Code::Unauthenticated as u8).to_string(),
             "compressed body must surface as UNAUTHENTICATED"
         );
+    }
+
+    // -- TrustedSubjectInterceptor -------------------------------------------
+
+    #[tokio::test]
+    async fn trusted_interceptor_attaches_subject_from_header() {
+        // Arrange — encode a System subject and set the trust header.
+        let subj = Subject::System {
+            system_id: Uuid::from_u128(0xABCD),
+            key_id: Uuid::from_u128(0x1234),
+            scopes: vec!["articles.stream".into()],
+        };
+        let layer = TrustedSubjectInterceptor::new();
+        let svc = CapturingService::default();
+        let captured = svc.captured.clone();
+        let mut svc = layer.layer(svc);
+
+        let raw = serde_json::to_string(&subj).unwrap();
+        let mut req = Request::builder().uri("/x/y").body(empty_body()).unwrap();
+        req.headers_mut()
+            .insert(TRUSTED_SUBJECT_HEADER, HeaderValue::from_str(&raw).unwrap());
+
+        // Act
+        let _ = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // Assert
+        let got = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(got, subj);
+    }
+
+    #[tokio::test]
+    async fn trusted_interceptor_rejects_missing_header_with_unauthenticated() {
+        // Arrange — no trust header at all.
+        let layer = TrustedSubjectInterceptor::new();
+        let svc = CapturingService::default();
+        let mut svc = layer.layer(svc);
+
+        let req = Request::builder().uri("/x/y").body(empty_body()).unwrap();
+
+        // Act
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            resp.headers().get("grpc-status").unwrap().to_str().unwrap(),
+            (tonic::Code::Unauthenticated as u8).to_string(),
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_interceptor_rejects_malformed_subject_json() {
+        // Arrange — header isn't valid Subject JSON.
+        let layer = TrustedSubjectInterceptor::new();
+        let svc = CapturingService::default();
+        let mut svc = layer.layer(svc);
+
+        let mut req = Request::builder().uri("/x/y").body(empty_body()).unwrap();
+        req.headers_mut()
+            .insert(TRUSTED_SUBJECT_HEADER, HeaderValue::from_static("not-json"));
+
+        // Act
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            resp.headers().get("grpc-status").unwrap().to_str().unwrap(),
+            (tonic::Code::Unauthenticated as u8).to_string(),
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_interceptor_strips_trusted_subject_header_before_processing() {
+        // Arrange — a malicious client supplies BOTH a forged trust header
+        // AND no Authorization. The public-listener interceptor must strip
+        // the trust header on entry, so the request resolves to
+        // `Subject::Anonymous` (because no Authorization), NOT to the
+        // forged subject.
+        let (strategy, _sk, _kid, _subj) = build_strategy().await;
+        let layer = AuthInterceptor::new(strategy, Arc::new(NoopBodyHasher));
+        let svc = CapturingService::default();
+        let captured = svc.captured.clone();
+        let mut svc = layer.layer(svc);
+
+        let forged = Subject::System {
+            system_id: Uuid::from_u128(0xDEAD),
+            key_id: Uuid::from_u128(0xBEEF),
+            scopes: vec!["*".into()],
+        };
+        let raw = serde_json::to_string(&forged).unwrap();
+
+        let mut req = Request::builder().uri("/x/y").body(empty_body()).unwrap();
+        req.headers_mut()
+            .insert(TRUSTED_SUBJECT_HEADER, HeaderValue::from_str(&raw).unwrap());
+
+        // Act
+        let _ = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // Assert — anonymous, NOT the forged System subject.
+        let got = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(got, Subject::Anonymous);
     }
 }
