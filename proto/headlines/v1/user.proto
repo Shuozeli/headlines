@@ -63,15 +63,22 @@ service UserService {
   // GetUser returns the user row, including soft-deleted rows
   // (status=DELETED, 200 — never NOT_FOUND for self/system).
   //
-  // Privacy: GetUser is NOT anonymous. Unauthorized callers receive
-  // `USER_NOT_FOUND` (NOT_FOUND) — not PERMISSION_DENIED — so the API
-  // does not leak user existence.
+  // Privacy: GetUser is NOT anonymous in the conventional sense — but
+  // the proto AUTH_TABLE *does* admit `SUBJECT_CLASS_ANONYMOUS` so the
+  // request can reach the handler. The handler then translates an
+  // unauthorized (anonymous or non-self) caller into `USER_NOT_FOUND`
+  // (NOT_FOUND), not PERMISSION_DENIED, so the API does not leak user
+  // existence (per `docs/design/users.md` privacy carve-out).
   rpc GetUser(GetUserRequest) returns (User) {
     option (google.api.http) = {
       get: "/v1/users/{id}"
     };
     option (headlines.v1.auth_requirement) = {
-      allowed_subjects: [SUBJECT_CLASS_USER_SELF, SUBJECT_CLASS_SYSTEM]
+      allowed_subjects: [
+        SUBJECT_CLASS_ANONYMOUS,
+        SUBJECT_CLASS_USER_SELF,
+        SUBJECT_CLASS_SYSTEM
+      ]
       required_scopes: ["users.read"]
     };
   }

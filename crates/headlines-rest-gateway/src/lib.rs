@@ -109,6 +109,7 @@ async fn get_openapi() -> impl IntoResponse {
 fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/openapi.json", get(get_openapi))
+        .route("/v1/accounts", post(create_account))
         .route("/v1/accounts/:id", get(get_account))
         .route("/v1/users", post(create_user))
         .route("/v1/users/:id", get(get_user))
@@ -177,6 +178,45 @@ fn build_router(state: GatewayState) -> Router {
             get(get_user_notification_preferences).patch(update_user_notification_preferences),
         )
         .with_state(state)
+}
+
+/// `POST /v1/accounts` — forwards to `AccountService.CreateAccount`.
+///
+/// Body shape: `{ short_name, author_name, author_url?, initial_key: { algo,
+/// public_key } }`. Mirrors the `POST /v1/users` handler.
+async fn create_account(
+    State(mut state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, GatewayError> {
+    let short_name = body
+        .get("short_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let author_name = body
+        .get("author_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let author_url = body
+        .get("author_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let initial_key = body.get("initial_key").map(parse_public_key);
+    let mut req = tonic::Request::new(headlines_proto::v1::CreateAccountRequest {
+        short_name,
+        author_name,
+        author_url,
+        initial_key,
+    });
+    forward_authorization(&headers, &mut req);
+    let resp = state.account_client.create_account(req).await?.into_inner();
+    Ok(Json(json!({
+        "account": resp.account.as_ref().map(account_to_json),
+        "key_id": resp.key_id,
+    })))
 }
 
 /// `GET /v1/accounts/{id}` — forwards to `AccountService.GetAccount`.

@@ -523,9 +523,11 @@ async fn get_user_anonymous_returns_not_found_for_privacy() {
         .await
         .expect_err("anonymous must be rejected");
 
-    // Assert — proto-level deny is PERMISSION_DENIED (anonymous not in
-    // allowed_subjects). This still doesn't leak existence.
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    // Assert — per `users.md` privacy carve-out, anonymous must surface
+    // USER_NOT_FOUND so the API does not leak user existence. The proto
+    // AUTH_TABLE admits ANONYMOUS for `GetUser`; the handler then
+    // translates an unauthorized (non-self) caller into `USER_NOT_FOUND`.
+    assert_eq!(err.code(), tonic::Code::NotFound);
 
     cleanup(&h.db, &[user_id]).await;
 }
