@@ -50,6 +50,10 @@ http-body-util = "0.1"
 bytes = "1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
 serde_json.workspace = true
 figment = { workspace = true, features = ["toml", "env", "test"] }
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+libc = "0.2"
+uuid = { workspace = true }
