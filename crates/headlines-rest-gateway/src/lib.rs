@@ -32,8 +32,9 @@ pub mod error;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete as axum_delete, get, patch, post, put};
@@ -41,6 +42,8 @@ use chrono::{TimeZone, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
+use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 
 use headlines_auth::{
     SignedRequestStrategy, TRUSTED_SUBJECT_HEADER, canonicalize_query, parse_authorization_header,
@@ -65,6 +68,31 @@ use headlines_proto::v1::notification_service_client::NotificationServiceClient;
 use headlines_proto::v1::user_service_client::UserServiceClient;
 
 pub use error::GatewayError;
+
+/// JSON body extractor that wraps `axum::Json<T>` and converts the stock
+/// `JsonRejection` into a `GatewayError`. The `IntoResponse` for
+/// `GatewayError` then emits the standard `{ code, message, details }`
+/// envelope, so body-parsing failures (malformed JSON, wrong Content-Type,
+/// oversized body, missing field) match the same error shape every other
+/// REST surface returns. Replaces every `Json<Value>` extractor in the
+/// route handlers below.
+pub struct EnvelopeJson<T>(pub T);
+
+#[async_trait::async_trait]
+impl<S, T> FromRequest<S> for EnvelopeJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = GatewayError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(EnvelopeJson(value)),
+            Err(rejection) => Err(GatewayError::from(rejection)),
+        }
+    }
+}
 
 /// Shared state given to each axum handler.
 #[derive(Clone)]
@@ -141,10 +169,27 @@ async fn get_openapi() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/json")], OPENAPI_JSON)
 }
 
+/// `GET /healthz` — liveness probe. Anonymous, no DB, no auth. Returns
+/// `200 OK` with `{"status": "ok"}` so external load balancers can verify
+/// the REST surface is up. Skips the auth pipeline because the route
+/// emits a constant body and never depends on backend state.
+async fn get_healthz() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
 /// Build the router from an already-constructed state. Splitting this out
 /// keeps the test path connection-free.
+///
+/// Middleware stack (applied bottom-up):
+///
+/// - `CorsLayer::permissive()` — v1 default. Production deployments should
+///   tighten this with an explicit origin allow-list and credentials policy.
+/// - `RequestDecompressionLayer` — transparently decodes
+///   `Content-Encoding: gzip` request bodies so clients can compress JSON
+///   payloads without having to special-case the gateway.
 fn build_router(state: GatewayState) -> Router {
     Router::new()
+        .route("/healthz", get(get_healthz))
         .route("/openapi.json", get(get_openapi))
         .route("/v1/accounts", post(create_account))
         .route("/v1/accounts/:id", get(get_account))
@@ -215,6 +260,10 @@ fn build_router(state: GatewayState) -> Router {
             get(get_user_notification_preferences).patch(update_user_notification_preferences),
         )
         .with_state(state)
+        // Decompression first (request hits this before any handler), then
+        // CORS so OPTIONS preflights short-circuit without the body layer.
+        .layer(RequestDecompressionLayer::new().gzip(true))
+        .layer(CorsLayer::permissive())
 }
 
 /// `POST /v1/accounts` — forwards to `AccountService.CreateAccount`.
@@ -226,7 +275,7 @@ async fn create_account(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let short_name = body
         .get("short_name")
@@ -298,7 +347,7 @@ async fn create_user(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let display_name = body
         .get("display_name")
@@ -358,7 +407,7 @@ async fn update_user(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     // Build the inner User: id from the path; display_name from the body.
     let display_name = body
@@ -419,7 +468,7 @@ async fn add_user_key(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let key = body.get("key").map(parse_public_key);
     let mut req = tonic::Request::new(headlines_proto::v1::AddUserKeyRequest { user_id: id, key });
@@ -664,7 +713,7 @@ async fn publish_article(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let title = body
         .get("title")
@@ -777,7 +826,7 @@ async fn edit_article(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let edit = body.get("edit").map(|v| {
         let title = v
@@ -831,7 +880,7 @@ async fn tombstone_article(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let reason = body
         .get("reason")
@@ -860,7 +909,7 @@ async fn redact_article_version(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((article_id, version)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let v: i32 = version.parse().map_err(|_| {
         GatewayError::from(tonic::Status::invalid_argument("version must be an int"))
@@ -1084,7 +1133,7 @@ async fn create_draft(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(account_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let title = body
         .get("title")
@@ -1154,7 +1203,7 @@ async fn update_draft(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let draft = body.get("draft").map(|v| {
         let title = v
@@ -1326,7 +1375,7 @@ async fn follow_user(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let account_id = body
         .get("account_id")
@@ -1523,7 +1572,7 @@ async fn replace_recommendation_feed(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let article_ids = body
         .get("article_ids")
@@ -1722,7 +1771,7 @@ async fn record_event(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let req = parse_record_event_request(&body);
     let mut tonic_req = tonic::Request::new(req);
@@ -1745,7 +1794,7 @@ async fn record_event_batch(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let events = body
         .get("events")
@@ -2038,7 +2087,7 @@ async fn send_notification(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let req = parse_send_notification_request(&body);
     let mut tonic_req = tonic::Request::new(req);
@@ -2067,7 +2116,7 @@ async fn send_notification_batch(
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     let notifications = body
         .get("notifications")
@@ -2218,7 +2267,7 @@ async fn update_user_notification_preferences(
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(user_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    EnvelopeJson(body): EnvelopeJson<Value>,
 ) -> Result<Json<Value>, GatewayError> {
     // Body shape: `{ "preferences": {...}, "update_mask": {"paths": [...]} }`.
     // Per the proto, the `preferences.user_id` field is the canonical

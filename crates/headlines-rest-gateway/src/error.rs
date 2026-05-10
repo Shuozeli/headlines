@@ -23,6 +23,7 @@
 //! UNAVAILABLE         → 503
 //! ```
 
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use prost::Message;
@@ -32,12 +33,25 @@ use tonic_types::pb::{ErrorInfo, Status as RpcStatus};
 /// Surface for REST gateway handlers. Either a `tonic::Status` (the typical
 /// case — upstream gRPC said no) or a transport error reaching the gRPC
 /// service at all.
+///
+/// `JsonReject` carries an explicit (HTTP status, gRPC code, message) tuple
+/// for body-parsing rejections from the `EnvelopeJson` extractor — e.g.
+/// malformed JSON (400), wrong Content-Type (415), oversized body (429). We
+/// preserve the HTTP status verbatim so the client sees the conventional
+/// HTTP code (415 for wrong CT) while still getting the standard
+/// gRPC-status-shaped envelope body.
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("gRPC status: {0}")]
     Grpc(#[from] tonic::Status),
     #[error("gRPC transport: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("body rejection: {message}")]
+    JsonReject {
+        http_status: StatusCode,
+        grpc_code: tonic::Code,
+        message: String,
+    },
 }
 
 impl IntoResponse for GatewayError {
@@ -55,6 +69,11 @@ impl IntoResponse for GatewayError {
                 e.to_string(),
                 Vec::new(),
             ),
+            GatewayError::JsonReject {
+                http_status,
+                grpc_code,
+                message,
+            } => (*http_status, *grpc_code as i32, message.clone(), Vec::new()),
         };
 
         let body = json!({
@@ -63,6 +82,52 @@ impl IntoResponse for GatewayError {
             "details": details,
         });
         (status, axum::response::Json(body)).into_response()
+    }
+}
+
+/// Map `axum::extract::rejection::JsonRejection` (the failure mode of the
+/// stock `axum::Json<T>` extractor) into a `GatewayError::JsonReject`. Used
+/// by the `EnvelopeJson<T>` extractor in `lib.rs` so body-parsing
+/// rejections surface as the standard `{ code, message, details }`
+/// envelope rather than axum's bare `text/plain` 400/415.
+///
+/// Mapping (per `docs/design/api-conventions.md`):
+///
+/// - Missing / wrong `Content-Type` → HTTP 415 + `INVALID_ARGUMENT`. The
+///   doc explicitly calls out "Other types: HTTP 415 (UNSUPPORTED_MEDIA_TYPE)".
+/// - Malformed JSON / bad shape → HTTP 400 + `INVALID_ARGUMENT`.
+/// - Oversized body → HTTP 429 + `RESOURCE_EXHAUSTED` (matches the
+///   `CONTENT_TOO_LARGE` envelope produced by the article publish handler).
+/// - Anything else → HTTP 400 + `INVALID_ARGUMENT` (catch-all).
+impl From<JsonRejection> for GatewayError {
+    fn from(rejection: JsonRejection) -> Self {
+        match rejection {
+            JsonRejection::MissingJsonContentType(_) => GatewayError::JsonReject {
+                http_status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                grpc_code: tonic::Code::InvalidArgument,
+                message: "expected request with Content-Type: application/json".to_owned(),
+            },
+            JsonRejection::JsonDataError(e) => GatewayError::JsonReject {
+                http_status: StatusCode::BAD_REQUEST,
+                grpc_code: tonic::Code::InvalidArgument,
+                message: format!("malformed JSON: {e}"),
+            },
+            JsonRejection::JsonSyntaxError(e) => GatewayError::JsonReject {
+                http_status: StatusCode::BAD_REQUEST,
+                grpc_code: tonic::Code::InvalidArgument,
+                message: format!("malformed JSON: {e}"),
+            },
+            JsonRejection::BytesRejection(e) => GatewayError::JsonReject {
+                http_status: StatusCode::TOO_MANY_REQUESTS,
+                grpc_code: tonic::Code::ResourceExhausted,
+                message: format!("request body too large: {e}"),
+            },
+            other => GatewayError::JsonReject {
+                http_status: StatusCode::BAD_REQUEST,
+                grpc_code: tonic::Code::InvalidArgument,
+                message: other.to_string(),
+            },
+        }
     }
 }
 
