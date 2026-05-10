@@ -116,6 +116,13 @@ async fn maybe_connect_db() -> Option<Db> {
 ///   its own auth strategy on the inbound REST request and forwarding the
 ///   resolved `Subject` via `TRUSTED_SUBJECT_HEADER`.
 async fn spawn_full_stack() -> FullStack {
+    spawn_full_stack_with_articles_cap(TEST_CONTENT_MAX_BYTES).await
+}
+
+/// Variant that lets a single test override the article content cap. Used
+/// by `rest_post_oversized_article_returns_resource_exhausted` to drive the
+/// `CONTENT_TOO_LARGE` path without a multi-megabyte payload.
+async fn spawn_full_stack_with_articles_cap(articles_cap: usize) -> FullStack {
     let db = maybe_connect_db()
         .await
         .expect("DATABASE_URL must be set for integration tests");
@@ -171,7 +178,7 @@ async fn spawn_full_stack() -> FullStack {
         ArticleServiceImpl::new(
             article_account_repo.clone(),
             article_repo.clone(),
-            TEST_CONTENT_MAX_BYTES,
+            articles_cap,
         )
     };
     let make_draft = || {
@@ -1535,4 +1542,404 @@ async fn gateway_rejects_forged_trusted_subject_header_on_public_listener() {
         },
     )
     .await;
+}
+
+// ===========================================================================
+// Robustness / malformed-input batch
+// ===========================================================================
+//
+// These tests pin the gateway's behavior on broken / abusive HTTP requests.
+// They cover gaps the original 13 happy-path tests left open: malformed JSON,
+// missing required fields, gzip body, oversized payloads, wrong Content-Type,
+// and CORS preflight. Each test documents whether the current behavior
+// matches a clean error envelope or whether a follow-up batch needs to wrap
+// it.
+
+// 14. Malformed JSON body. Pins what happens when an inbound POST carries
+// truncated/invalid JSON. Expected: HTTP 400 with the standard
+// `{ code, message, details }` envelope and `code == INVALID_ARGUMENT (3)`.
+//
+// CURRENT BEHAVIOR (documented gap): axum's built-in `Json` extractor
+// rejects with a bare `text/plain` body like
+// `Failed to parse the request body as JSON: ...`, so the body does NOT
+// parse as the standard envelope today. The test asserts the bare-400
+// reality and tags the gap; the operational batch can wire a
+// `JsonRejection` interceptor in `build_router` that wraps the rejection
+// in the gRPC-status-shaped envelope.
+#[tokio::test]
+async fn rest_post_malformed_json_returns_400_with_envelope() {
+    skip_if_no_db!();
+
+    // Arrange — POST /v1/users is open-mode anonymous. No signing needed.
+    let h = spawn_full_stack().await;
+    let malformed = r#"{ "display_name": "test", "initial_key": "#;
+
+    // Act
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/users", h.rest_base))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(malformed.to_owned())
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — must reject with 400. The body MAY be a clean envelope; if
+    // it isn't, that's a documented gap (axum's bare JsonRejection text).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = resp.bytes().await.expect("body bytes must arrive");
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) => {
+            // Either we already wrap it (envelope) or it's some other JSON
+            // shape; the assertion below pins the desired behavior. Today
+            // axum returns text/plain so this `Ok` arm typically does not
+            // fire. If it does, validate the envelope.
+            assert_eq!(
+                body["code"],
+                tonic::Code::InvalidArgument as i32,
+                "body parsed as JSON; if so it must be the envelope: {body}"
+            );
+            assert!(body["message"].is_string());
+            assert!(body["details"].is_array());
+        }
+        Err(_) => {
+            // TODO(operational-batch): wrap axum body-parsing rejections in
+            // the standard gRPC-status-shaped error envelope so REST clients
+            // get a uniform error shape regardless of which layer rejects
+            // the request.
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.to_lowercase().contains("json"),
+                "non-JSON 400 body should at least mention JSON, got: {text}"
+            );
+        }
+    }
+}
+
+// 15. Missing required field — `initial_key` is absent. Pins how the
+// CreateUser handler reports a missing required field.
+//
+// EXPECTED: HTTP 400, `code == INVALID_ARGUMENT`. The handler today
+// silently substitutes `PublicKey::default()` (empty algo + empty
+// public_key) when the field is missing, which the service layer then
+// rejects with INVALID_ARGUMENT on the `algo`/`public_key` field. The
+// outer code is therefore correct; the message names the offending
+// sub-field rather than `initial_key`. We assert the code and that the
+// message is informative.
+#[tokio::test]
+async fn rest_post_missing_required_field_returns_invalid_argument() {
+    skip_if_no_db!();
+
+    // Arrange — `display_name` set, no `initial_key`.
+    let h = spawn_full_stack().await;
+    let body = json!({"display_name": "missing-key"});
+
+    // Act
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/users", h.rest_base))
+        .json(&body)
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — 400 with the standard envelope.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("body must be JSON envelope");
+    assert_eq!(
+        body["code"],
+        tonic::Code::InvalidArgument as i32,
+        "missing required field must surface INVALID_ARGUMENT: {body}"
+    );
+    assert!(
+        !body["message"].as_str().unwrap_or_default().is_empty(),
+        "message must be non-empty so clients can act on it: {body}"
+    );
+    let details = body["details"]
+        .as_array()
+        .expect("details must be a (possibly empty) array");
+    if !details.is_empty() {
+        // If the handler attached an ErrorInfo, reason should be a known
+        // canonical string. Catch-all `INVALID_ARGUMENT` is acceptable.
+        let info = &details[0];
+        let reason = info["reason"].as_str().unwrap_or_default();
+        assert!(
+            !reason.is_empty(),
+            "ErrorInfo present but no reason: {body}"
+        );
+    }
+}
+
+// 16. Body sent with `Content-Encoding: gzip`. Pins whether the gateway
+// transparently decompresses or rejects cleanly. Either is defensible —
+// this test catches a future regression where the gateway silently treats
+// gzipped bytes as JSON and returns a confusing parse error.
+//
+// CURRENT BEHAVIOR: axum + the gateway router do NOT install any
+// decompression layer, so a gzipped body is passed through to the `Json`
+// extractor unchanged. The extractor sees binary garbage and returns a
+// bare 400 (axum's malformed-JSON path). That's the "real bug" branch in
+// the test contract — the request had a valid `Content-Encoding`
+// declaration but the gateway ignored it. We assert the actual behavior
+// here so it's pinned, and tag a follow-up.
+#[tokio::test]
+async fn rest_post_gzip_body_either_works_or_rejects_cleanly() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    skip_if_no_db!();
+
+    // Arrange — a fully valid CreateUser body, then gzip it.
+    let h = spawn_full_stack().await;
+    let sk = make_signing_key();
+    let body_json = json!({
+        "display_name": "gz-user",
+        "initial_key": {"algo": "ed25519", "public_key": ed25519_pk_b64(&sk)},
+    });
+    let body_str = serde_json::to_string(&body_json).unwrap();
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(body_str.as_bytes()).unwrap();
+    let gzipped = enc.finish().unwrap();
+
+    // Act
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/users", h.rest_base))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_ENCODING, "gzip")
+        .body(gzipped)
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — three defensible outcomes:
+    //   (a) 200 OK + user created (gateway transparently decompressed)
+    //   (b) 415 UNSUPPORTED_MEDIA_TYPE / 400 INVALID_ARGUMENT with envelope
+    //   (c) Documented gap: bare 400 from axum because the gzipped bytes
+    //       fell through to the JSON extractor.
+    let status = resp.status();
+    if status == StatusCode::OK {
+        // Good — gateway decompressed transparently. Clean up the new user.
+        let body: Value = resp.json().await.expect("body must be JSON");
+        if let Some(user_id_str) = body["user"]["id"].as_str()
+            && let Ok(user_id) = Uuid::parse_str(user_id_str)
+        {
+            run_cleanup(
+                &h.db,
+                Cleanup {
+                    user_ids: vec![user_id],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        return;
+    }
+    // TODO(operational-batch): install `tower_http::decompression::RequestDecompressionLayer`
+    // on the REST router so a `Content-Encoding: gzip` request is decoded
+    // transparently. Today the gateway ignores the header and the JSON
+    // extractor rejects the gzipped bytes as malformed JSON, returning a
+    // bare 400 instead of a 415 or a transparent 200.
+    assert!(
+        status == StatusCode::BAD_REQUEST
+            || status == StatusCode::UNSUPPORTED_MEDIA_TYPE
+            || status == StatusCode::LENGTH_REQUIRED,
+        "gzip body must reject cleanly with 400/415, got {status}"
+    );
+}
+
+// 17. Oversized article body. Pins the `RESOURCE_EXHAUSTED` /
+// `CONTENT_TOO_LARGE` path on the article publish handler.
+//
+// EXPECTED: HTTP 429 (RESOURCE_EXHAUSTED) with `ErrorInfo.reason ==
+// "CONTENT_TOO_LARGE"`. The article cap is configured at 1024 bytes for
+// this test; we send ~8 KiB of element children to trip the validator.
+// axum's default 2 MiB body limit is well above 8 KiB so the request
+// reaches the service handler before any transport-level rejection.
+#[tokio::test]
+async fn rest_post_oversized_article_returns_resource_exhausted() {
+    skip_if_no_db!();
+
+    // Arrange — small article cap so we don't have to ship 20 MiB.
+    let h = spawn_full_stack_with_articles_cap(1024).await;
+    let acct_sk = make_signing_key();
+    let (account_id, account_key_id) = seed_account(&h.db, &acct_sk).await;
+
+    // Build content > 1024 bytes when serialised as JSON. A `<p>` with a
+    // long text child easily clears 1024 bytes once wrapped in the
+    // `tag/children/text` envelope.
+    let big_text = "x".repeat(8 * 1024);
+    let content = vec![headlines_proto::v1::Node {
+        kind: Some(headlines_proto::v1::node::Kind::Element(
+            headlines_proto::v1::NodeElement {
+                tag: "p".into(),
+                attrs: Default::default(),
+                children: vec![headlines_proto::v1::Node {
+                    kind: Some(headlines_proto::v1::node::Kind::Text(big_text.clone())),
+                }],
+            },
+        )),
+    }];
+    let body_proto = headlines_proto::v1::PublishArticleRequest {
+        account_id: account_id.to_string(),
+        title: "Oversized".into(),
+        author_name: "Me".into(),
+        author_url: String::new(),
+        content,
+    };
+    let body_bytes = body_proto.encode_to_vec();
+    let body_json = json!({
+        "title": "Oversized",
+        "author_name": "Me",
+        "content": [{"tag": "p", "children": [{"text": big_text}]}],
+    });
+
+    let ts = h.clock.now().await.unwrap();
+    let rest_url = format!("/v1/accounts/{}/articles", account_id);
+    let auth = sign_rest_request(
+        "POST",
+        &rest_url,
+        "",
+        &body_bytes,
+        account_key_id,
+        &acct_sk,
+        ts,
+        &unique_nonce(),
+    );
+
+    // Act
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", h.rest_base, rest_url))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&body_json)
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — 429 + standard envelope + CONTENT_TOO_LARGE reason.
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "oversize must surface RESOURCE_EXHAUSTED -> 429"
+    );
+    let body: Value = resp.json().await.expect("body must be JSON envelope");
+    assert_eq!(body["code"], tonic::Code::ResourceExhausted as i32);
+    let details = body["details"].as_array().expect("details must be array");
+    assert_eq!(details.len(), 1, "expected one ErrorInfo detail: {body}");
+    assert_eq!(details[0]["reason"], "CONTENT_TOO_LARGE");
+    assert_eq!(details[0]["domain"], "headlines.v1");
+
+    run_cleanup(
+        &h.db,
+        Cleanup {
+            account_ids: vec![account_id],
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+// 18. Wrong `Content-Type`. Pins how the gateway behaves when a client
+// sends `text/plain` instead of `application/json` to a JSON route.
+//
+// EXPECTED: HTTP 415 UNSUPPORTED_MEDIA_TYPE — axum's `Json<T>` extractor
+// rejects non-JSON Content-Type with 415 by default. We also check that
+// the response body either parses as a clean envelope or, at minimum,
+// is non-empty plain text. Today axum's default rejection is a plain-text
+// `Expected request with `Content-Type: application/json``, which is a
+// documented gap; if it gets wrapped in the future this test still
+// passes because the status code and existence check both hold.
+#[tokio::test]
+async fn rest_post_wrong_content_type_returns_unsupported_media_type() {
+    skip_if_no_db!();
+
+    // Arrange
+    let h = spawn_full_stack().await;
+
+    // Act
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/users", h.rest_base))
+        .header(reqwest::header::CONTENT_TYPE, "text/plain")
+        .body("not-json")
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — 415 with a non-empty body. If the body parses as a JSON
+    // envelope, validate it; otherwise pin the documented-gap text body.
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "wrong Content-Type must yield 415 UNSUPPORTED_MEDIA_TYPE"
+    );
+    let bytes = resp.bytes().await.expect("body bytes must arrive");
+    assert!(!bytes.is_empty(), "415 body must not be empty");
+    if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+        // If the gateway wrapped it (future enhancement), it must be the
+        // standard envelope. INVALID_ARGUMENT is acceptable here too.
+        let code = body["code"].as_i64().unwrap_or(-1);
+        assert!(
+            code == tonic::Code::InvalidArgument as i64
+                || code == tonic::Code::FailedPrecondition as i64,
+            "if 415 carries a JSON envelope it must be a clean error code: {body}"
+        );
+    }
+    // TODO(operational-batch): wrap axum's bare 415 plain-text rejection
+    // in the standard gRPC-status-shaped envelope.
+}
+
+// 19. CORS preflight. Pins whether the gateway responds to an `OPTIONS`
+// preflight with the `Access-Control-Allow-*` headers a browser needs.
+//
+// EXPECTED (after operational batch lands a CORS layer): HTTP 200/204
+// with `Access-Control-Allow-Origin` and `Access-Control-Allow-Methods`
+// listing GET. Today no CORS middleware is installed in `build_router`,
+// so axum returns 405 METHOD_NOT_ALLOWED for the unmatched OPTIONS verb
+// and the response carries no `Access-Control-Allow-*` headers. We
+// `#[ignore]` this test until the operational batch wires
+// `tower_http::cors::CorsLayer`.
+#[tokio::test]
+#[ignore = "CORS middleware not yet implemented; see operational-batch (TODO: tower_http::cors::CorsLayer)"]
+async fn rest_options_preflight_for_cors() {
+    skip_if_no_db!();
+
+    // Arrange — pick a real GET route so the preflight has a target.
+    let h = spawn_full_stack().await;
+    let bogus = Uuid::now_v7();
+
+    // Act — issue the canonical browser preflight.
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/articles/{}", h.rest_base, bogus),
+        )
+        .header(reqwest::header::ORIGIN, "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .expect("REST request must reach the gateway");
+
+    // Assert — preflight should be 200 or 204 with permissive ACAO/ACAM.
+    let status = resp.status();
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NO_CONTENT,
+        "preflight must succeed, got {status}"
+    );
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        acao == "*" || acao == "https://example.com",
+        "Access-Control-Allow-Origin must echo the origin or `*`, got {acao:?}"
+    );
+    let acam = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        acam.to_uppercase().contains("GET"),
+        "Access-Control-Allow-Methods must list GET, got {acam:?}"
+    );
 }

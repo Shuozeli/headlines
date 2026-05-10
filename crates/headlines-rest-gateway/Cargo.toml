@@ -32,6 +32,7 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+flate2 = "1"
 prost.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 sha2.workspace = true
