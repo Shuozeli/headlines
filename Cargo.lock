@@ -952,6 +952,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64",
  "bytes",
  "chrono",
@@ -961,6 +962,7 @@ dependencies = [
  "headlines-auth",
  "headlines-core",
  "headlines-proto",
+ "headlines-rest-gateway",
  "headlines-store",
  "http",
  "http-body-util",
@@ -969,6 +971,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.8.6",
+ "reqwest",
  "serde_json",
  "serial_test",
  "sha2 0.10.9",

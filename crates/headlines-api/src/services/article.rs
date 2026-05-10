@@ -564,6 +564,15 @@ where
             return Err(Status::permission_denied("not permitted on this article"));
         }
 
+        // Account-state precondition: a soft-deleted account cannot accept
+        // new writes (per `accounts.md` "Subsequent writes on a deleted
+        // account → ACCOUNT_DELETED"). Mirrors the same check in
+        // `publish_article`. Surfaced by the W5 workflow test.
+        let acct = self.accounts.get(owner).await.map_err(Status::from)?;
+        if acct.status == AccountStatus::Deleted {
+            return Err(HeadlinesError::AccountDeleted { id: owner }.into());
+        }
+
         // Build the repo-level edit DTO from the masked fields.
         let mut edit = DomainArticleEdit::default();
         if mask_set.contains("title") {

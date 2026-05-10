@@ -483,3 +483,12 @@ resolved in the original sub-phase. Pattern: `- [<phase>] <issue> — <follow-up
   loopback-listener mechanism + future mTLS upgrade path;
   `docs/design/api-conventions.md` adds a worked
   `POST /v1/articles/{id}/tombstone` example.
+- [workflow-bug] [W5] `ArticleServiceImpl::edit_article` was missing the
+  account-state precondition that `publish_article` already enforces. A
+  soft-deleted account could continue editing its previously-published
+  articles even though `accounts.md` says writes on a deleted account
+  should fail with `FAILED_PRECONDITION` `ACCOUNT_DELETED`. Fixed by
+  reading the owning account via `self.accounts.get(owner)` after the
+  auth gate and returning `HeadlinesError::AccountDeleted` on
+  `status == Deleted`. Surfaced and pinned by the W5 workflow test
+  (`crates/headlines-api/tests/workflow.rs::account_lifecycle_publish_then_delete_keeps_articles_visible_but_blocks_new_writes`).
