@@ -1539,3 +1539,131 @@ async fn system_with_follows_write_can_follow_on_behalf() {
     cleanup_follows(&h.db, &[user_id], &[account_id]).await;
     cleanup_system(&h.db, system_id).await;
 }
+
+// ===========================================================================
+// Concurrency
+// ===========================================================================
+
+#[tokio::test]
+async fn concurrent_follow_unfollow_toggles_converge_to_terminal_state() {
+    skip_if_no_db!();
+
+    // Arrange — N=10 concurrent toggles (5 Follow + 5 Unfollow). Per
+    // `docs/design/follows.md`, `Follow` is an idempotent UPSERT and
+    // `Unfollow` flips status; concurrent toggles converge to a deterministic
+    // terminal state (ACTIVE or UNFOLLOWED). This pins that the service
+    // handler doesn't lose updates or hit a constraint violation under
+    // contention. Unfollow on a missing edge is allowed (FOLLOW_NOT_FOUND)
+    // and counted as a no-op.
+    let mut h = spawn_server().await;
+    let user_sk = make_signing_key();
+    let acct_sk = make_signing_key();
+    let (user_id, user_key) = seed_user_with_key(&h.db, &user_sk).await;
+    let (account_id, _) = seed_account_with_key(&h.db, &acct_sk).await;
+
+    // Pre-mint signed requests on the test thread; each request needs a
+    // unique nonce and timestamp slot.
+    let barrier = Arc::new(tokio::sync::Barrier::new(10));
+    let mut tasks: Vec<tokio::task::JoinHandle<Result<(), tonic::Status>>> = Vec::with_capacity(10);
+
+    for i in 0..10 {
+        let ts = h.clock.now().await.unwrap();
+        let mut client = h.client.clone();
+        let bar = barrier.clone();
+        if i % 2 == 0 {
+            let req = signed(
+                FollowRequest {
+                    user_id: user_id.to_string(),
+                    account_id: account_id.to_string(),
+                },
+                &user_sk,
+                user_key,
+                "/headlines.v1.FollowService/Follow",
+                ts,
+                &unique_nonce(),
+            );
+            tasks.push(tokio::spawn(async move {
+                bar.wait().await;
+                client.follow(req).await.map(|_| ())
+            }));
+        } else {
+            let req = signed(
+                UnfollowRequest {
+                    user_id: user_id.to_string(),
+                    account_id: account_id.to_string(),
+                },
+                &user_sk,
+                user_key,
+                "/headlines.v1.FollowService/Unfollow",
+                ts,
+                &unique_nonce(),
+            );
+            tasks.push(tokio::spawn(async move {
+                bar.wait().await;
+                client.unfollow(req).await.map(|_| ())
+            }));
+        }
+    }
+
+    let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut out = Vec::with_capacity(10);
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    })
+    .await
+    .expect("concurrent toggles complete within 5s");
+
+    // Assert — every outcome is either Ok or a documented FOLLOW_NOT_FOUND
+    // (an Unfollow that raced in front of any Follow). No other error code
+    // should surface under contention. No constraint violations or
+    // Internal errors leak.
+    for outcome in &outcomes {
+        match outcome {
+            Ok(_) => {}
+            Err(e) => {
+                assert_eq!(
+                    e.code(),
+                    tonic::Code::NotFound,
+                    "Unfollow-before-any-Follow must surface NotFound, got code = {:?}, msg = {:?}",
+                    e.code(),
+                    e.message(),
+                );
+            }
+        }
+    }
+
+    // Definitive end state via GetFollow. Acceptable terminal states:
+    //   - the row exists with status ACTIVE or UNFOLLOWED (typical), OR
+    //   - NotFound iff every Follow happened to be in flight before the
+    //     last Unfollow that successfully ran (impossible here because
+    //     Follow is an UPSERT that always writes a row; once any Follow
+    //     completes, the row exists for the rest of the test). We assert
+    //     a follow row exists in some terminal state.
+    let ts = h.clock.now().await.unwrap();
+    let got = h
+        .client
+        .get_follow(signed(
+            GetFollowRequest {
+                user_id: user_id.to_string(),
+                account_id: account_id.to_string(),
+            },
+            &user_sk,
+            user_key,
+            "/headlines.v1.FollowService/GetFollow",
+            ts,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("GetFollow after toggle storm must succeed")
+        .into_inner();
+    let status = got.status;
+    assert!(
+        status == FollowStatus::Active as i32 || status == FollowStatus::Unfollowed as i32,
+        "terminal status must be ACTIVE or UNFOLLOWED, got {}",
+        status,
+    );
+
+    cleanup_follows(&h.db, &[user_id], &[account_id]).await;
+}

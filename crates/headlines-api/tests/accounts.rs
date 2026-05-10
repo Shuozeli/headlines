@@ -1410,3 +1410,129 @@ async fn revoke_account_key_on_deleted_account_returns_account_deleted() {
     cleanup(&h.db, &[acc]).await;
     cleanup_system(&h.db, system_id).await;
 }
+
+// ===========================================================================
+// Concurrency: revocation invalidates in-flight requests
+// ===========================================================================
+
+#[tokio::test]
+async fn request_signed_with_just_revoked_key_is_rejected() {
+    skip_if_no_db!();
+
+    // Arrange — account with two active keys. Sign a `GetAccount` request
+    // with key2 BUT capture the signed metadata; do not send yet. Per
+    // `docs/design/auth.md`: "Revoked keys reject immediately on the next
+    // request." The PostgresKeyResolver does no caching so a freshly
+    // revoked key must surface as UNAUTHENTICATED with the auth strategy's
+    // "key revoked" message.
+    let mut h = spawn_server(BootstrapMode::Open).await;
+    let sk1 = make_signing_key();
+    let (acc, key1) = create_self_account(&mut h, &sk1).await;
+
+    // Add a second key.
+    let sk2 = make_signing_key();
+    let add_req = AddAccountKeyRequest {
+        account_id: acc.to_string(),
+        key: Some(PublicKey {
+            algo: "ed25519".into(),
+            public_key: ed25519_pk_b64(&sk2),
+        }),
+    };
+    let ts = h.clock.now().await.unwrap();
+    let added = h
+        .client
+        .add_account_key(signed(
+            add_req,
+            &sk1,
+            key1,
+            "/headlines.v1.AccountService/AddAccountKey",
+            ts,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("AddAccountKey")
+        .into_inner();
+    let key2 = Uuid::parse_str(&added.key_id).unwrap();
+
+    // Build a signed GetAccount under key2 — the request is fully formed
+    // and ready to send, but we hold off on sending until after revocation.
+    let ts_get = h.clock.now().await.unwrap();
+    let stale_get = signed(
+        GetAccountRequest {
+            id: acc.to_string(),
+        },
+        &sk2,
+        key2,
+        "/headlines.v1.AccountService/GetAccount",
+        ts_get,
+        &unique_nonce(),
+    );
+
+    // Revoke key2 with key1 (which is still active).
+    let ts_rev = h.clock.now().await.unwrap();
+    let revoked = h
+        .client
+        .revoke_account_key(signed(
+            RevokeAccountKeyRequest {
+                account_id: acc.to_string(),
+                key_id: key2.to_string(),
+            },
+            &sk1,
+            key1,
+            "/headlines.v1.AccountService/RevokeAccountKey",
+            ts_rev,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("RevokeAccountKey")
+        .into_inner();
+    assert_eq!(
+        revoked.status,
+        headlines_proto::v1::KeyStatus::Revoked as i32
+    );
+
+    // Act — send the previously-signed (now-stale) request.
+    let err = h
+        .client
+        .get_account(stale_get)
+        .await
+        .expect_err("request signed with just-revoked key must reject");
+
+    // Assert — UNAUTHENTICATED with the strategy's "key revoked" reason.
+    // The interceptor maps `AuthError::Unauthenticated` directly into a
+    // `tonic::Status::unauthenticated(msg)` — the AuthError display for
+    // a revoked key is the literal string "key revoked"
+    // (see `headlines-auth/src/strategy.rs`).
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(
+        err.message().contains("key revoked"),
+        "UNAUTHENTICATED message must contain 'key revoked', got {:?}",
+        err.message(),
+    );
+
+    // Sanity: the still-active key1 can still sign new requests, so the
+    // revocation didn't cascade or otherwise break the account.
+    let ts2 = h.clock.now().await.unwrap();
+    let upd = UpdateAccountRequest {
+        account: Some(account_msg(&acc.to_string(), "", "Still Works", "")),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["author_name".into()],
+        }),
+    };
+    let r = h
+        .client
+        .update_account(signed(
+            upd,
+            &sk1,
+            key1,
+            "/headlines.v1.AccountService/UpdateAccount",
+            ts2,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("UpdateAccount with surviving key1 must succeed")
+        .into_inner();
+    assert_eq!(r.author_name, "Still Works");
+
+    cleanup(&h.db, &[acc]).await;
+}

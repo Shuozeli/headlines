@@ -1124,3 +1124,142 @@ async fn get_on_deleted_user_is_user_deleted() {
 
     cleanup_feed(&h.db, &[user_id], &[], &[]).await;
 }
+
+// ===========================================================================
+// Concurrency
+// ===========================================================================
+
+#[tokio::test]
+async fn concurrent_replaces_serialize_last_writer_wins() {
+    skip_if_no_db!();
+
+    // Arrange — two distinct article-id sequences for the same user. Per
+    // `docs/design/feed-recommendation.md`, `replace` is a single
+    // DELETE-then-INSERT tx; concurrent calls serialize at the DB and the
+    // post-state contains exactly one of the two sequences (no
+    // interleaving).
+    let mut h = spawn_server().await;
+    let user_sk = make_signing_key();
+    let (user_id, _) = seed_user_with_key(&h.db, &user_sk).await;
+    let account_id = seed_account(&h.db).await;
+
+    // Six articles split into two non-overlapping triples (TEST_REPLACE_CAP=3).
+    let a1 = seed_live_article(&h.db, account_id).await;
+    let a2 = seed_live_article(&h.db, account_id).await;
+    let a3 = seed_live_article(&h.db, account_id).await;
+    let b1 = seed_live_article(&h.db, account_id).await;
+    let b2 = seed_live_article(&h.db, account_id).await;
+    let b3 = seed_live_article(&h.db, account_id).await;
+    let set_a: std::collections::HashSet<Uuid> = [a1, a2, a3].into_iter().collect();
+    let set_b: std::collections::HashSet<Uuid> = [b1, b2, b3].into_iter().collect();
+
+    let sys_sk = make_signing_key();
+    let (system_id, sys_key) = insert_system(
+        &h.db,
+        "ranker",
+        &["feeds.recommendation.write", "feeds.recommendation.read"],
+        &sys_sk,
+    )
+    .await;
+
+    let req_a = ReplaceRecommendationFeedRequest {
+        user_id: user_id.to_string(),
+        article_ids: vec![a1.to_string(), a2.to_string(), a3.to_string()],
+    };
+    let req_b = ReplaceRecommendationFeedRequest {
+        user_id: user_id.to_string(),
+        article_ids: vec![b1.to_string(), b2.to_string(), b3.to_string()],
+    };
+    let ts_a = h.clock.now().await.unwrap();
+    let ts_b = h.clock.now().await.unwrap();
+    let signed_a = signed(
+        req_a,
+        &sys_sk,
+        sys_key,
+        "/headlines.v1.FeedRecommendationService/ReplaceRecommendationFeed",
+        ts_a,
+        &unique_nonce(),
+    );
+    let signed_b = signed(
+        req_b,
+        &sys_sk,
+        sys_key,
+        "/headlines.v1.FeedRecommendationService/ReplaceRecommendationFeed",
+        ts_b,
+        &unique_nonce(),
+    );
+
+    // Act — release both at the same instant via a shared barrier.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut c_a = h.client.clone();
+    let mut c_b = h.client.clone();
+    let bar_a = barrier.clone();
+    let bar_b = barrier.clone();
+    let h_a = tokio::spawn(async move {
+        bar_a.wait().await;
+        c_a.replace_recommendation_feed(signed_a).await
+    });
+    let h_b = tokio::spawn(async move {
+        bar_b.wait().await;
+        c_b.replace_recommendation_feed(signed_b).await
+    });
+    let (r_a, r_b) = tokio::time::timeout(Duration::from_secs(5), async {
+        (h_a.await.unwrap(), h_b.await.unwrap())
+    })
+    .await
+    .expect("concurrent ReplaceRecommendationFeed completes within 5s");
+
+    // Assert — both calls succeed (DB serializes the two DELETE/INSERT txs).
+    let resp_a = r_a.expect("Replace A must succeed").into_inner();
+    let resp_b = r_b.expect("Replace B must succeed").into_inner();
+    assert_eq!(resp_a.stored_count, 3);
+    assert_eq!(resp_b.stored_count, 3);
+
+    // Read back — the persisted feed must equal exactly set_a or set_b
+    // (no interleaving). We assert membership; the order within the
+    // winning set is the order that writer submitted.
+    let ts = h.clock.now().await.unwrap();
+    let get_resp = h
+        .client
+        .get_recommendation_feed(signed(
+            GetRecommendationFeedRequest {
+                user_id: user_id.to_string(),
+                page_size: 50,
+                page_token: String::new(),
+            },
+            &sys_sk,
+            sys_key,
+            "/headlines.v1.FeedRecommendationService/GetRecommendationFeed",
+            ts,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("GetRecommendationFeed after concurrent replaces")
+        .into_inner();
+
+    let stored_ids: Vec<Uuid> = get_resp
+        .items
+        .iter()
+        .map(|it| {
+            Uuid::parse_str(&it.article.as_ref().expect("article must be set").id).expect("uuid")
+        })
+        .collect();
+    assert_eq!(
+        stored_ids.len(),
+        3,
+        "feed must contain exactly 3 items, got {:?}",
+        stored_ids,
+    );
+    let stored_set: std::collections::HashSet<Uuid> = stored_ids.iter().copied().collect();
+    assert!(
+        stored_set == set_a || stored_set == set_b,
+        "feed must equal exactly set_a or set_b (no interleaving). \
+         got = {:?}, set_a = {:?}, set_b = {:?}",
+        stored_set,
+        set_a,
+        set_b,
+    );
+
+    cleanup_feed(&h.db, &[user_id], &[account_id], &[a1, a2, a3, b1, b2, b3]).await;
+    cleanup_system(&h.db, system_id).await;
+}

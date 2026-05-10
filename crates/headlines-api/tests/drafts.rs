@@ -20,9 +20,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use ed25519_dalek::{Signer, SigningKey};
+use prost::Message as _;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tonic::transport::{Channel, Endpoint, Server};
+use tonic_types::pb::{ErrorInfo, Status as RpcStatus};
 use uuid::Uuid;
 
 use headlines_api::{ArticleServiceImpl, DraftServiceImpl};
@@ -1112,13 +1114,38 @@ async fn publish_draft_uses_same_uuid_and_clears_the_draft() {
     cleanup_drafts_and_articles(&h.db, &[acct]).await;
 }
 
+/// Pull `ErrorInfo.reason` out of a tonic `Status`. Empty string if no
+/// `google.rpc.Status` details were attached or the detail isn't an
+/// `ErrorInfo`. The handler always attaches one via `HeadlinesError`'s
+/// `Into<Status>` impl.
+fn error_reason(status: &tonic::Status) -> String {
+    let bytes = status.details();
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let rpc = match RpcStatus::decode(bytes) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    for any in &rpc.details {
+        if any.type_url == "type.googleapis.com/google.rpc.ErrorInfo"
+            && let Ok(info) = ErrorInfo::decode(any.value.as_ref())
+        {
+            return info.reason;
+        }
+    }
+    String::new()
+}
+
 #[tokio::test]
-async fn publish_draft_concurrent_calls_serialize_loser_sees_draft_not_found() {
+async fn concurrent_publishes_serialize_loser_sees_draft_not_found() {
     skip_if_no_db!();
 
     // Arrange — one draft, two concurrent PublishDraft calls. Exactly one
     // wins; the other observes the post-deletion state and returns
-    // DRAFT_NOT_FOUND.
+    // DRAFT_NOT_FOUND. Per `docs/design/drafts.md`:
+    //   "Concurrent publishes on the same draft serialize via `FOR UPDATE`;
+    //    the loser sees `DRAFT_NOT_FOUND`."
     let mut h = spawn_server().await;
     let sk = make_signing_key();
     let (acct, key_id) = seed_account_with_key(&h.db, &sk).await;
@@ -1144,19 +1171,144 @@ async fn publish_draft_concurrent_calls_serialize_loser_sees_draft_not_found() {
     );
 
     // Act — fire both concurrently on independent client clones (spawn
-    // task per call so the runtime executes them in parallel).
+    // task per call so the runtime executes them in parallel). Bound the
+    // joint act so a hung handler can't stall CI.
     let mut c1 = h.drafts.clone();
     let mut c2 = h.drafts.clone();
     let f1 = tokio::spawn(async move { c1.publish_draft(req1).await });
     let f2 = tokio::spawn(async move { c2.publish_draft(req2).await });
-    let r1 = f1.await.unwrap();
-    let r2 = f2.await.unwrap();
+    let (r1, r2) = tokio::time::timeout(Duration::from_secs(5), async {
+        let a = f1.await.unwrap();
+        let b = f2.await.unwrap();
+        (a, b)
+    })
+    .await
+    .expect("concurrent PublishDraft completes within 5s");
 
-    // Assert — exactly one Ok and one NotFound.
+    // Assert — exactly one Ok and one NotFound with reason DRAFT_NOT_FOUND.
     let oks = [r1.is_ok(), r2.is_ok()].iter().filter(|b| **b).count();
     assert_eq!(oks, 1, "exactly one PublishDraft must win the race");
-    let err = if let Err(e) = r1 { e } else { r2.unwrap_err() };
+    let (winner_id, err) = match (r1, r2) {
+        (Ok(ok), Err(e)) => (Uuid::parse_str(&ok.into_inner().id).unwrap(), e),
+        (Err(e), Ok(ok)) => (Uuid::parse_str(&ok.into_inner().id).unwrap(), e),
+        _ => unreachable!("oks == 1 above"),
+    };
     assert_eq!(err.code(), tonic::Code::NotFound);
+    assert_eq!(
+        error_reason(&err),
+        "DRAFT_NOT_FOUND",
+        "loser must surface ErrorInfo.reason = DRAFT_NOT_FOUND",
+    );
+    // Winner's article id must be the draft id (UUID continuity).
+    assert_eq!(winner_id, id);
+
+    // Subsequent GetArticle returns the new live article.
+    let got = h
+        .articles
+        .get_article(tonic::Request::new(GetArticleRequest {
+            id: id.to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.id, id.to_string());
+    assert_eq!(got.state, ArticleState::Live as i32);
+
+    cleanup_drafts_and_articles(&h.db, &[acct]).await;
+}
+
+#[tokio::test]
+async fn concurrent_updates_to_same_draft_last_writer_wins() {
+    skip_if_no_db!();
+
+    // Arrange — single draft; two concurrent UpdateDraft calls each set a
+    // distinct valid title. Per `docs/design/drafts.md`, drafts have no
+    // explicit OCC; concurrent writers should both succeed and the
+    // post-state should reflect one of the two titles exactly (no merge).
+    let mut h = spawn_server().await;
+    let sk = make_signing_key();
+    let (acct, key_id) = seed_account_with_key(&h.db, &sk).await;
+    let id = create_draft(&mut h, &sk, acct, key_id, "v0").await;
+
+    let mk_update = |title: &str, ts: Tso| {
+        let req = UpdateDraftRequest {
+            draft: Some(ProtoDraft {
+                id: id.to_string(),
+                title: title.to_owned(),
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["title".into()],
+            }),
+        };
+        signed(
+            req,
+            &sk,
+            key_id,
+            "/headlines.v1.DraftService/UpdateDraft",
+            ts,
+            &unique_nonce(),
+        )
+    };
+
+    let ts_a = h.clock.now().await.unwrap();
+    let ts_b = h.clock.now().await.unwrap();
+    let req_a = mk_update("title-A", ts_a);
+    let req_b = mk_update("title-B", ts_b);
+
+    // Act — fire both concurrently with a shared barrier so the runtime
+    // releases them at the same instant.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut c_a = h.drafts.clone();
+    let mut c_b = h.drafts.clone();
+    let bar_a = barrier.clone();
+    let bar_b = barrier.clone();
+    let h_a = tokio::spawn(async move {
+        bar_a.wait().await;
+        c_a.update_draft(req_a).await
+    });
+    let h_b = tokio::spawn(async move {
+        bar_b.wait().await;
+        c_b.update_draft(req_b).await
+    });
+    let (r_a, r_b) = tokio::time::timeout(Duration::from_secs(5), async {
+        (h_a.await.unwrap(), h_b.await.unwrap())
+    })
+    .await
+    .expect("concurrent UpdateDraft completes within 5s");
+
+    // Assert — both succeed; final state is exactly one of the two titles.
+    let resp_a = r_a.expect("UpdateDraft A must succeed").into_inner();
+    let resp_b = r_b.expect("UpdateDraft B must succeed").into_inner();
+    assert!(matches!(resp_a.title.as_str(), "title-A" | "title-B"));
+    assert!(matches!(resp_b.title.as_str(), "title-A" | "title-B"));
+
+    // Definitive state: a follow-up GetDraft must return one of the two
+    // values exactly (no merge, no error). updated_at is bumped past the
+    // pre-update zero state implicitly by Update success.
+    let ts = h.clock.now().await.unwrap();
+    let got = h
+        .drafts
+        .get_draft(signed(
+            GetDraftRequest { id: id.to_string() },
+            &sk,
+            key_id,
+            "/headlines.v1.DraftService/GetDraft",
+            ts,
+            &unique_nonce(),
+        ))
+        .await
+        .expect("GetDraft after concurrent updates")
+        .into_inner();
+    assert!(
+        got.title == "title-A" || got.title == "title-B",
+        "post-state must equal one of the two writer values exactly, got {:?}",
+        got.title,
+    );
+    assert!(
+        got.updated_at.is_some(),
+        "updated_at must be set after a successful UpdateDraft",
+    );
 
     cleanup_drafts_and_articles(&h.db, &[acct]).await;
 }
