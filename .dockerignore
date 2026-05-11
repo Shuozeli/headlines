@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+.vscode/
+.idea/
+**/*.swp
+**/.DS_Store
+docs/
+README.md
+gen/openapi/openapi.json.bak
+demo/seed-state.json

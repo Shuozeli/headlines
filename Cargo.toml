@@ -85,6 +85,10 @@ serial_test = "3"
 phf = { version = "0.11", features = ["macros"] }
 phf_codegen = "0.11"
 
+# --- Demo seed (Markdown → Telegraph Node, frontmatter, deterministic RNG) ---
+pulldown-cmark = { version = "0.12", default-features = false }
+rand_chacha = "0.3"
+
 # --- Internal crates ---
 headlines-proto = { path = "crates/headlines-proto" }
 headlines-core = { path = "crates/headlines-core" }

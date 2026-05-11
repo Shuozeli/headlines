@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: cyuan
+      POSTGRES_PASSWORD: cyuan
+      POSTGRES_DB: headlines
+    volumes:
+      - headlines-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyuan -d headlines"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "${TAILSCALE_IP:-0.0.0.0}:5433:5432"
+
+  headlines:
+    build: .
+    environment:
+      HEADLINES_DATABASE__URL: postgres://cyuan:cyuan@postgres:5432/headlines
+      RUST_LOG: info,headlines_server=info,headlines_api=info,headlines_auth=warn
+      HEADLINES_DEMO_SEED_ON_BOOT: "1"
+      HEADLINES_DEMO_PATH: /app/demo
+      # Open registration so the seed binary can self-register accounts/users.
+      HEADLINES_AUTH__BOOTSTRAP__ACCOUNT_REGISTRATION: open
+      HEADLINES_AUTH__BOOTSTRAP__USER_REGISTRATION: open
+    ports:
+      - "${TAILSCALE_IP:-0.0.0.0}:50061:50051"
+      - "${TAILSCALE_IP:-0.0.0.0}:8088:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  headlines-pg-data: {}

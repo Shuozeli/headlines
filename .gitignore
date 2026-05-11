@@ -7,6 +7,9 @@
 .env.local
 config.local.toml
 
+# Demo seed state — regenerated on each seed run; per-instance UUIDs.
+demo/seed-state.json
+
 # Editor / IDE
 .vscode/
 .idea/

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "headlines-server", version)]
@@ -33,6 +33,57 @@ pub struct Cli {
     /// are run separately by an operator/CI step.
     #[arg(long, default_value_t = false)]
     pub skip_migrations: bool,
+
+    /// Optional subcommand. When omitted the binary boots the server as
+    /// usual; when present, the subcommand runs and the binary exits.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Demo-data subcommands.
+    Demo {
+        #[command(subcommand)]
+        cmd: DemoCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DemoCmd {
+    /// Seed the database with demo content. Idempotent unless --reset.
+    Seed {
+        /// Wipe demo data before seeding. Destructive; demo databases only.
+        #[arg(long)]
+        reset: bool,
+        /// Path to the demo data root (defaults to `./demo`).
+        #[arg(long, default_value = "demo")]
+        path: PathBuf,
+        /// Skip publishing articles. Useful for fast iteration.
+        #[arg(long)]
+        skip_articles: bool,
+        /// Deterministic-RNG seed for reproducible event distributions.
+        #[arg(long, default_value_t = 42)]
+        rng_seed: u64,
+        /// gRPC endpoint to dial. Defaults to the bound public listener.
+        #[arg(long)]
+        grpc_endpoint: Option<String>,
+    },
+    /// Print copy-pasteable curl commands for the demo flows.
+    CurlExamples {
+        /// Path to the demo data root (defaults to `./demo`).
+        #[arg(long, default_value = "demo")]
+        path: PathBuf,
+        /// REST gateway base URL. Defaults to http://localhost:8080.
+        #[arg(long, default_value = "http://localhost:8080")]
+        base_url: String,
+    },
+    /// Generate any missing keypairs under demo/keys/.
+    InitKeys {
+        /// Path to the demo data root (defaults to `./demo`).
+        #[arg(long, default_value = "demo")]
+        path: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -48,6 +99,7 @@ mod tests {
         assert!(cli.config.is_none());
         assert!(cli.grpc_port.is_none());
         assert!(!cli.skip_migrations);
+        assert!(cli.command.is_none());
     }
 
     #[test]
@@ -76,5 +128,34 @@ mod tests {
         assert_eq!(cli.rest_host.as_deref(), Some("10.0.0.1"));
         assert_eq!(cli.rest_port, Some(9090));
         assert!(cli.skip_migrations);
+    }
+
+    #[test]
+    fn parses_demo_seed_subcommand() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["headlines-server", "demo", "seed", "--reset"]).unwrap();
+
+        // Assert
+        match cli.command {
+            Some(Command::Demo {
+                cmd: DemoCmd::Seed { reset, .. },
+            }) => assert!(reset),
+            other => panic!("expected demo seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_demo_init_keys_subcommand() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["headlines-server", "demo", "init-keys", "--path", "demo"])
+            .unwrap();
+
+        // Assert
+        assert!(matches!(
+            cli.command,
+            Some(Command::Demo {
+                cmd: DemoCmd::InitKeys { .. }
+            })
+        ));
     }
 }

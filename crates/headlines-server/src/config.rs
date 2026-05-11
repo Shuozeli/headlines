@@ -289,6 +289,7 @@ mod tests {
             rest_host: None,
             rest_port: None,
             skip_migrations: false,
+            command: None,
         }
     }
 

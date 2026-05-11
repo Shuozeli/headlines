@@ -38,6 +38,21 @@ serde.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 
+# --- Demo seed support ---
+diesel.workspace = true
+diesel-async.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+sha2.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+uuid.workspace = true
+pulldown-cmark.workspace = true
+
 # --- Observability ---
 tracing.workspace = true
 tracing-subscriber.workspace = true

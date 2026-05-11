@@ -21,6 +21,7 @@ mod cli;
 mod config;
 mod metrics;
 mod observability;
+mod seed;
 mod tailscale;
 
 use std::sync::Arc;
@@ -54,13 +55,20 @@ use headlines_proto::v1::notification_service_server::NotificationServiceServer;
 use headlines_proto::v1::user_service_server::UserServiceServer;
 use headlines_store::Db;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command, DemoCmd};
 use crate::config::Config;
 use crate::tailscale::{BindAddrs, BindSource};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // ---- Demo subcommand dispatch (early-return — these don't bring up the
+    //      full server). InitKeys & CurlExamples don't even need DB access.
+    if let Some(Command::Demo { cmd }) = &cli.command {
+        return run_demo_subcommand(cmd, &cli).await;
+    }
+
     let config = Config::load(&cli)?;
     let _otel_guard = observability::init(&config.observability)?;
     let _metrics_guard = metrics::init_meter_provider(&config.observability);
@@ -387,11 +395,175 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ---- Boot-time auto-seed (HEADLINES_DEMO_SEED_ON_BOOT=1) ----
+    //
+    // After the gRPC/REST listeners are spawned, dial the local public gRPC
+    // surface (in a separate task) and walk the demo seed sequence. The
+    // server keeps serving once the seed finishes; the seed task exits.
+    //
+    // Idempotent: the seed checks `accounts` and `seed-state.json` before
+    // creating new rows, so this is safe to run on every boot.
+    let seed_task: Option<tokio::task::JoinHandle<()>> = if seed_on_boot() {
+        let endpoint = format!("http://127.0.0.1:{}", grpc_addr.port());
+        let demo_path = seed::runner::default_demo_path();
+        let seed_db = db.clone();
+        Some(tokio::spawn(async move {
+            // Brief delay to let the listener bind; the seed has its own
+            // retry loop on connect anyway.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Decide whether to run based on whether `accounts` is empty.
+            match accounts_table_empty(&seed_db).await {
+                Ok(true) => {
+                    info!("HEADLINES_DEMO_SEED_ON_BOOT=1; running demo seed");
+                    if let Err(e) =
+                        seed::run_seed(seed_db.clone(), &endpoint, &demo_path, 42, false, false)
+                            .await
+                    {
+                        tracing::error!(error = %e, "demo seed failed");
+                    } else {
+                        info!("demo seed completed");
+                    }
+                }
+                Ok(false) => {
+                    info!("demo data already present, skipping boot-time seed");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "could not check accounts table; skipping seed");
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Wait for all three surfaces to finish (Ctrl-C / SIGTERM trigger
     // shutdown_signal which unblocks each server concurrently).
     let _ = tokio::join!(grpc_handle, trusted_handle, rest_handle);
+    if let Some(h) = seed_task {
+        h.abort();
+    }
     info!("headlines-server shutdown complete");
 
+    Ok(())
+}
+
+fn seed_on_boot() -> bool {
+    std::env::var("HEADLINES_DEMO_SEED_ON_BOOT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+async fn accounts_table_empty(db: &Db) -> anyhow::Result<bool> {
+    use diesel_async::RunQueryDsl;
+    let mut conn = db.get().await?;
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: Cnt = diesel::sql_query("SELECT COUNT(*)::bigint AS n FROM accounts")
+        .get_result(&mut conn)
+        .await?;
+    Ok(row.n == 0)
+}
+
+async fn run_demo_subcommand(cmd: &DemoCmd, cli: &Cli) -> anyhow::Result<()> {
+    // Lightweight tracing setup for demo CLI calls.
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init();
+
+    match cmd {
+        DemoCmd::InitKeys { path } => {
+            seed::keys::ensure_canonical_keys(path).context("ensure keys")?;
+            info!("demo keys present at {}", path.display());
+            Ok(())
+        }
+        DemoCmd::CurlExamples { path, base_url } => {
+            print_curl_examples(path, base_url)?;
+            Ok(())
+        }
+        DemoCmd::Seed {
+            reset,
+            path,
+            skip_articles,
+            rng_seed,
+            grpc_endpoint,
+        } => {
+            // Seed needs a DB connection. Load config to find the URL.
+            let config = Config::load(cli)?;
+            let db = Db::connect(&config.database.url, config.database.max_connections)
+                .await
+                .context("connect to Postgres for seed")?;
+            // Run pending migrations unless --skip-migrations.
+            if !cli.skip_migrations {
+                headlines_store::run_pending_migrations(&db)
+                    .await
+                    .context("apply migrations before seed")?;
+            }
+            let endpoint = grpc_endpoint.clone().unwrap_or_else(|| {
+                format!(
+                    "http://{}:{}",
+                    if config.server.grpc_host == "0.0.0.0" {
+                        "127.0.0.1".to_owned()
+                    } else {
+                        config.server.grpc_host.clone()
+                    },
+                    config.server.grpc_port
+                )
+            });
+            seed::run_seed(db, &endpoint, path, *rng_seed, *skip_articles, *reset).await?;
+            Ok(())
+        }
+    }
+}
+
+fn print_curl_examples(path: &std::path::Path, base_url: &str) -> anyhow::Result<()> {
+    let (state, _) =
+        seed::state::SeedState::load_or_default(path).context("load seed-state.json")?;
+    if state.accounts.is_empty() {
+        println!(
+            "No seed-state.json found at {}/seed-state.json.",
+            path.display()
+        );
+        println!("Run: headlines-server demo seed");
+        return Ok(());
+    }
+    println!("# headlines demo — copy-pasteable curl examples");
+    println!("# All read endpoints below are anonymous-readable. Signed");
+    println!("# endpoints would require a fresh signature each call; we");
+    println!("# print only the unsigned readable surface here.");
+    println!();
+    if let Some(alice) = state.users.get("alice") {
+        println!("# Alice's user record");
+        println!("curl {base_url}/v1/users/{}", alice.id);
+        println!();
+    }
+    if let Some(techblog) = state.accounts.get("techblog") {
+        println!("# techblog account");
+        println!("curl {base_url}/v1/accounts/{}", techblog.id);
+        println!();
+        println!("# techblog articles (anonymous-readable list)");
+        println!("curl {base_url}/v1/accounts/{}/articles", techblog.id);
+        println!();
+    }
+    if let Some((_, art_id)) = state.articles.iter().next() {
+        println!("# A single article (anonymous-readable)");
+        println!("curl {base_url}/v1/articles/{}", art_id);
+        println!();
+    }
+    println!("# Full grpcurl example: list accounts via gRPC");
+    println!("grpcurl -plaintext localhost:50051 list headlines.v1.AccountService");
+    println!();
+    println!("# To run authenticated requests, use the keypairs in");
+    println!(
+        "# {}/keys and the canonical signing format documented",
+        path.display()
+    );
+    println!("# in docs/design/auth.md.");
     Ok(())
 }
 
