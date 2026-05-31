@@ -40,10 +40,10 @@ pbjson-build = "0.7"
 pbjson-types = "0.7"
 
 # --- Database (Diesel) ---
-diesel = { version = "2.2", features = ["postgres", "uuid", "chrono", "serde_json"] }
-diesel-async = { version = "0.6", features = ["postgres", "deadpool"] }
+diesel = { version = "2.3.8", features = ["postgres", "uuid", "chrono", "serde_json"] }
+diesel-async = { version = "0.9", features = ["postgres", "deadpool"] }
 deadpool = "0.12"
-diesel_migrations = { version = "2.2", features = ["postgres"] }
+diesel_migrations = { version = "2.3", features = ["postgres"] }
 
 # --- Crypto ---
 ed25519-dalek = { version = "2", features = ["rand_core"] }

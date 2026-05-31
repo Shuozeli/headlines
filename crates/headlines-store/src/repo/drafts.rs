@@ -22,7 +22,7 @@
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde_json::Value as Json;
 use uuid::Uuid;
 
@@ -257,77 +257,74 @@ impl DraftRepo for PgDraftRepo {
         let id_for_tx = id;
 
         let row: DraftRow = conn
-            .transaction::<_, TxError, _>(|conn| {
+            .transaction::<_, TxError, _>(async |conn| {
                 let upd = update.clone();
-                async move {
-                    // Confirm existence first so missing → DraftNotFound,
-                    // not just an empty UPDATE result.
-                    let existing: Option<DraftRow> = drafts::table
-                        .filter(drafts::id.eq(id_for_tx))
-                        .select(DraftRow::as_select())
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(tx_internal("select drafts for update"))?;
-                    if existing.is_none() {
-                        return Err(TxError::Domain(HeadlinesError::DraftNotFound {
-                            id: id_for_tx,
-                        }));
-                    }
+                // Confirm existence first so missing -> DraftNotFound,
+                // not just an empty UPDATE result.
+                let existing: Option<DraftRow> = drafts::table
+                    .filter(drafts::id.eq(id_for_tx))
+                    .select(DraftRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(tx_internal("select drafts for update"))?;
+                if existing.is_none() {
+                    return Err(TxError::Domain(HeadlinesError::DraftNotFound {
+                        id: id_for_tx,
+                    }));
+                }
 
-                    let target = drafts::table.filter(drafts::id.eq(id_for_tx));
-                    let title_ref = upd.title.as_deref();
-                    let an_ref = upd.author_name.as_deref();
-                    let au_ref = upd.author_url.as_deref();
-                    let content_ref = upd.content.as_ref();
+                let target = drafts::table.filter(drafts::id.eq(id_for_tx));
+                let title_ref = upd.title.as_deref();
+                let an_ref = upd.author_name.as_deref();
+                let au_ref = upd.author_url.as_deref();
+                let content_ref = upd.content.as_ref();
 
-                    // Always bump updated_at; build a tuple of changes.
-                    // Use BoxableExpression-style explicit calls.
-                    if let Some(t) = title_ref {
-                        diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
-                            .set(drafts::title.eq(t))
-                            .execute(conn)
-                            .await
-                            .map_err(tx_internal("update drafts.title"))?;
-                    }
-                    if let Some(an) = an_ref {
-                        let v: Option<&str> = if an.is_empty() { None } else { Some(an) };
-                        diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
-                            .set(drafts::author_name.eq(v))
-                            .execute(conn)
-                            .await
-                            .map_err(tx_internal("update drafts.author_name"))?;
-                    }
-                    if let Some(au) = au_ref {
-                        let v: Option<&str> = if au.is_empty() { None } else { Some(au) };
-                        diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
-                            .set(drafts::author_url.eq(v))
-                            .execute(conn)
-                            .await
-                            .map_err(tx_internal("update drafts.author_url"))?;
-                    }
-                    if let Some(c) = content_ref {
-                        diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
-                            .set(drafts::content.eq(c))
-                            .execute(conn)
-                            .await
-                            .map_err(tx_internal("update drafts.content"))?;
-                    }
-                    diesel::update(target)
-                        .set(drafts::updated_at.eq(now))
+                // Always bump updated_at; build a tuple of changes.
+                // Use BoxableExpression-style explicit calls.
+                if let Some(t) = title_ref {
+                    diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
+                        .set(drafts::title.eq(t))
                         .execute(conn)
                         .await
-                        .map_err(tx_internal("update drafts.updated_at"))?;
-
-                    let row: DraftRow = drafts::table
-                        .filter(drafts::id.eq(id_for_tx))
-                        .select(DraftRow::as_select())
-                        .first(conn)
-                        .await
-                        .map_err(tx_internal("re-select drafts after update"))?;
-                    Ok::<DraftRow, TxError>(row)
+                        .map_err(tx_internal("update drafts.title"))?;
                 }
-                .scope_boxed()
+                if let Some(an) = an_ref {
+                    let v: Option<&str> = if an.is_empty() { None } else { Some(an) };
+                    diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
+                        .set(drafts::author_name.eq(v))
+                        .execute(conn)
+                        .await
+                        .map_err(tx_internal("update drafts.author_name"))?;
+                }
+                if let Some(au) = au_ref {
+                    let v: Option<&str> = if au.is_empty() { None } else { Some(au) };
+                    diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
+                        .set(drafts::author_url.eq(v))
+                        .execute(conn)
+                        .await
+                        .map_err(tx_internal("update drafts.author_url"))?;
+                }
+                if let Some(c) = content_ref {
+                    diesel::update(drafts::table.filter(drafts::id.eq(id_for_tx)))
+                        .set(drafts::content.eq(c))
+                        .execute(conn)
+                        .await
+                        .map_err(tx_internal("update drafts.content"))?;
+                }
+                diesel::update(target)
+                    .set(drafts::updated_at.eq(now))
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("update drafts.updated_at"))?;
+
+                let row: DraftRow = drafts::table
+                    .filter(drafts::id.eq(id_for_tx))
+                    .select(DraftRow::as_select())
+                    .first(conn)
+                    .await
+                    .map_err(tx_internal("re-select drafts after update"))?;
+                Ok::<DraftRow, TxError>(row)
             })
             .await?;
 
@@ -439,78 +436,75 @@ impl DraftRepo for PgDraftRepo {
         // loser sees DraftNotFound (the row was deleted by the winner inside
         // the same tx).
         let result: ArticlePieces = conn
-            .transaction::<_, TxError, _>(|conn| {
-                async move {
-                    // FOR UPDATE on the draft row — diesel's `for_update()` is
-                    // the AsyncConnection-friendly way to take a row lock.
-                    let row: Option<DraftRow> = drafts::table
-                        .filter(drafts::id.eq(id_for_tx))
-                        .for_update()
-                        .select(DraftRow::as_select())
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(tx_internal("select drafts for publish"))?;
-                    let row = row.ok_or(TxError::Domain(HeadlinesError::DraftNotFound {
-                        id: id_for_tx,
-                    }))?;
+            .transaction::<_, TxError, _>(async |conn| {
+                // FOR UPDATE on the draft row - diesel's `for_update()` is
+                // the AsyncConnection-friendly way to take a row lock.
+                let row: Option<DraftRow> = drafts::table
+                    .filter(drafts::id.eq(id_for_tx))
+                    .for_update()
+                    .select(DraftRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(tx_internal("select drafts for publish"))?;
+                let row = row.ok_or(TxError::Domain(HeadlinesError::DraftNotFound {
+                    id: id_for_tx,
+                }))?;
 
-                    diesel::insert_into(articles::table)
-                        .values(InsertArticle {
-                            id: row.id,
-                            account_id: row.account_id,
-                            state: "live",
-                            created_at: now,
-                        })
-                        .execute(conn)
-                        .await
-                        .map_err(tx_internal("insert articles"))?;
-
-                    diesel::insert_into(articles_live::table)
-                        .values(InsertArticleLive {
-                            article_id: row.id,
-                            current_version: 1,
-                            published_at: now,
-                            updated_at: now,
-                        })
-                        .execute(conn)
-                        .await
-                        .map_err(tx_internal("insert articles_live"))?;
-
-                    let an: Option<&str> = row.author_name.as_deref();
-                    let au: Option<&str> = row.author_url.as_deref();
-                    diesel::insert_into(article_versions::table)
-                        .values(InsertArticleVersion {
-                            article_id: row.id,
-                            version: 1,
-                            title: row.title.as_str(),
-                            author_name: an,
-                            author_url: au,
-                            content: Some(&row.content),
-                            created_at: now,
-                        })
-                        .execute(conn)
-                        .await
-                        .map_err(tx_internal("insert article_versions"))?;
-
-                    diesel::delete(drafts::table.filter(drafts::id.eq(id_for_tx)))
-                        .execute(conn)
-                        .await
-                        .map_err(tx_internal("delete drafts after publish"))?;
-
-                    Ok::<ArticlePieces, TxError>(ArticlePieces {
+                diesel::insert_into(articles::table)
+                    .values(InsertArticle {
                         id: row.id,
                         account_id: row.account_id,
-                        title: row.title,
-                        author_name: row.author_name.unwrap_or_default(),
-                        author_url: row.author_url.unwrap_or_default(),
-                        content: row.content,
-                        published_at: now,
-                        updated_at: now,
+                        state: "live",
                         created_at: now,
                     })
-                }
-                .scope_boxed()
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("insert articles"))?;
+
+                diesel::insert_into(articles_live::table)
+                    .values(InsertArticleLive {
+                        article_id: row.id,
+                        current_version: 1,
+                        published_at: now,
+                        updated_at: now,
+                    })
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("insert articles_live"))?;
+
+                let an: Option<&str> = row.author_name.as_deref();
+                let au: Option<&str> = row.author_url.as_deref();
+                diesel::insert_into(article_versions::table)
+                    .values(InsertArticleVersion {
+                        article_id: row.id,
+                        version: 1,
+                        title: row.title.as_str(),
+                        author_name: an,
+                        author_url: au,
+                        content: Some(&row.content),
+                        created_at: now,
+                    })
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("insert article_versions"))?;
+
+                diesel::delete(drafts::table.filter(drafts::id.eq(id_for_tx)))
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("delete drafts after publish"))?;
+
+                Ok::<ArticlePieces, TxError>(ArticlePieces {
+                    id: row.id,
+                    account_id: row.account_id,
+                    title: row.title,
+                    author_name: row.author_name.unwrap_or_default(),
+                    author_url: row.author_url.unwrap_or_default(),
+                    content: row.content,
+                    published_at: now,
+                    updated_at: now,
+                    created_at: now,
+                })
             })
             .await?;
 

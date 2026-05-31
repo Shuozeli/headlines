@@ -17,7 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::{Int4, Uuid as SqlUuid};
-use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use headlines_core::HeadlinesError;
@@ -184,37 +184,34 @@ impl FeedRecommendationRepo for PgFeedRecommendationRepo {
         let mut conn = self.db.get().await.map_err(HeadlinesError::Internal)?;
         let n: i32 = article_ids.len() as i32;
 
-        conn.transaction::<_, TxError, _>(|conn| {
+        conn.transaction::<_, TxError, _>(async |conn| {
             let ids = article_ids.clone();
-            async move {
-                diesel::delete(
-                    feed_recommendation::table.filter(feed_recommendation::user_id.eq(user_id)),
-                )
-                .execute(conn)
-                .await
-                .map_err(tx_internal("delete feed_recommendation"))?;
+            diesel::delete(
+                feed_recommendation::table.filter(feed_recommendation::user_id.eq(user_id)),
+            )
+            .execute(conn)
+            .await
+            .map_err(tx_internal("delete feed_recommendation"))?;
 
-                if !ids.is_empty() {
-                    let rows: Vec<NewFeedRow> = ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, article_id)| NewFeedRow {
-                            user_id,
-                            position: idx as i32,
-                            article_id,
-                        })
-                        .collect();
+            if !ids.is_empty() {
+                let rows: Vec<NewFeedRow> = ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, article_id)| NewFeedRow {
+                        user_id,
+                        position: idx as i32,
+                        article_id,
+                    })
+                    .collect();
 
-                    diesel::insert_into(feed_recommendation::table)
-                        .values(&rows)
-                        .execute(conn)
-                        .await
-                        .map_err(tx_internal("insert feed_recommendation"))?;
-                }
-
-                Ok::<(), TxError>(())
+                diesel::insert_into(feed_recommendation::table)
+                    .values(&rows)
+                    .execute(conn)
+                    .await
+                    .map_err(tx_internal("insert feed_recommendation"))?;
             }
-            .scope_boxed()
+
+            Ok::<(), TxError>(())
         })
         .await?;
 

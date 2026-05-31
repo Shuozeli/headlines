@@ -17,7 +17,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde_json::Value as Json;
 use uuid::Uuid;
 
@@ -267,59 +267,56 @@ impl ArticleRepo for PgArticleRepo {
         let new_author_url = new.author_url.clone();
         let new_content = new.content.clone();
 
-        conn.transaction::<_, TxError, _>(|conn| {
-            async move {
-                diesel::insert_into(articles::table)
-                    .values(InsertArticle {
-                        id: new_id,
-                        account_id: new_account_id,
-                        state: "live",
-                        created_at: now,
-                    })
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("insert articles"))?;
+        conn.transaction::<_, TxError, _>(async |conn| {
+            diesel::insert_into(articles::table)
+                .values(InsertArticle {
+                    id: new_id,
+                    account_id: new_account_id,
+                    state: "live",
+                    created_at: now,
+                })
+                .execute(conn)
+                .await
+                .map_err(tx_internal("insert articles"))?;
 
-                diesel::insert_into(articles_live::table)
-                    .values(InsertArticleLive {
-                        article_id: new_id,
-                        current_version: 1,
-                        published_at: now,
-                        updated_at: now,
-                    })
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("insert articles_live"))?;
+            diesel::insert_into(articles_live::table)
+                .values(InsertArticleLive {
+                    article_id: new_id,
+                    current_version: 1,
+                    published_at: now,
+                    updated_at: now,
+                })
+                .execute(conn)
+                .await
+                .map_err(tx_internal("insert articles_live"))?;
 
-                let title = new_title.as_str();
-                let author_name = if new_author_name.is_empty() {
-                    None
-                } else {
-                    Some(new_author_name.as_str())
-                };
-                let author_url = if new_author_url.is_empty() {
-                    None
-                } else {
-                    Some(new_author_url.as_str())
-                };
-                let content_ref = &new_content;
-                diesel::insert_into(article_versions::table)
-                    .values(InsertArticleVersion {
-                        article_id: new_id,
-                        version: 1,
-                        title,
-                        author_name,
-                        author_url,
-                        content: Some(content_ref),
-                        created_at: now,
-                    })
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("insert article_versions"))?;
+            let title = new_title.as_str();
+            let author_name = if new_author_name.is_empty() {
+                None
+            } else {
+                Some(new_author_name.as_str())
+            };
+            let author_url = if new_author_url.is_empty() {
+                None
+            } else {
+                Some(new_author_url.as_str())
+            };
+            let content_ref = &new_content;
+            diesel::insert_into(article_versions::table)
+                .values(InsertArticleVersion {
+                    article_id: new_id,
+                    version: 1,
+                    title,
+                    author_name,
+                    author_url,
+                    content: Some(content_ref),
+                    created_at: now,
+                })
+                .execute(conn)
+                .await
+                .map_err(tx_internal("insert article_versions"))?;
 
-                Ok::<(), TxError>(())
-            }
-            .scope_boxed()
+            Ok::<(), TxError>(())
         })
         .await?;
 
@@ -571,87 +568,84 @@ impl ArticleRepo for PgArticleRepo {
         let now = Utc::now();
         let id_for_tx = id;
 
-        conn.transaction::<_, TxError, _>(|conn| {
-            async move {
-                // Lock-free SELECTs first; conflicts are rare and Postgres'
-                // RC default is fine for this workload.
-                let article: ArticleRow = articles::table
-                    .filter(articles::id.eq(id_for_tx))
-                    .select(ArticleRow::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(tx_internal("select articles"))?
-                    .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound {
-                        id: id_for_tx,
-                    }))?;
-                if article.state == "tombstone" {
-                    return Err(TxError::Domain(HeadlinesError::ArticleTombstoned {
-                        id: id_for_tx,
-                    }));
-                }
+        conn.transaction::<_, TxError, _>(async |conn| {
+            // Lock-free SELECTs first; conflicts are rare and Postgres'
+            // RC default is fine for this workload.
+            let article: ArticleRow = articles::table
+                .filter(articles::id.eq(id_for_tx))
+                .select(ArticleRow::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(tx_internal("select articles"))?
+                .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound {
+                    id: id_for_tx,
+                }))?;
+            if article.state == "tombstone" {
+                return Err(TxError::Domain(HeadlinesError::ArticleTombstoned {
+                    id: id_for_tx,
+                }));
+            }
 
-                let live: ArticleLiveRow = articles_live::table
-                    .filter(articles_live::article_id.eq(id_for_tx))
-                    .select(ArticleLiveRow::as_select())
-                    .first(conn)
-                    .await
-                    .map_err(tx_internal("select articles_live"))?;
-                let cur_version: ArticleVersionRow = article_versions::table
-                    .filter(article_versions::article_id.eq(id_for_tx))
-                    .filter(article_versions::version.eq(live.current_version))
-                    .select(ArticleVersionRow::as_select())
-                    .first(conn)
-                    .await
-                    .map_err(tx_internal("select current article_versions"))?;
+            let live: ArticleLiveRow = articles_live::table
+                .filter(articles_live::article_id.eq(id_for_tx))
+                .select(ArticleLiveRow::as_select())
+                .first(conn)
+                .await
+                .map_err(tx_internal("select articles_live"))?;
+            let cur_version: ArticleVersionRow = article_versions::table
+                .filter(article_versions::article_id.eq(id_for_tx))
+                .filter(article_versions::version.eq(live.current_version))
+                .select(ArticleVersionRow::as_select())
+                .first(conn)
+                .await
+                .map_err(tx_internal("select current article_versions"))?;
 
-                // Apply the edit on top of the current version. Whichever
-                // fields are not in the mask carry over as-is.
-                let title = edit.title.clone().unwrap_or(cur_version.title);
-                let author_name = edit
-                    .author_name
-                    .clone()
-                    .or(cur_version.author_name)
-                    .unwrap_or_default();
-                let author_url = edit
-                    .author_url
-                    .clone()
-                    .or(cur_version.author_url)
-                    .unwrap_or_default();
-                let content = edit
-                    .content
-                    .clone()
-                    .or(cur_version.content)
-                    .unwrap_or(Json::Array(vec![]));
+            // Apply the edit on top of the current version. Whichever
+            // fields are not in the mask carry over as-is.
+            let title = edit.title.clone().unwrap_or(cur_version.title);
+            let author_name = edit
+                .author_name
+                .clone()
+                .or(cur_version.author_name)
+                .unwrap_or_default();
+            let author_url = edit
+                .author_url
+                .clone()
+                .or(cur_version.author_url)
+                .unwrap_or_default();
+            let content = edit
+                .content
+                .clone()
+                .or(cur_version.content)
+                .unwrap_or(Json::Array(vec![]));
 
-                let next_v = live.current_version + 1;
-                let an = if author_name.is_empty() {
-                    None
-                } else {
-                    Some(author_name.as_str())
-                };
-                let au = if author_url.is_empty() {
-                    None
-                } else {
-                    Some(author_url.as_str())
-                };
-                diesel::insert_into(article_versions::table)
-                    .values(InsertArticleVersion {
-                        article_id: id_for_tx,
-                        version: next_v,
-                        title: title.as_str(),
-                        author_name: an,
-                        author_url: au,
-                        content: Some(&content),
-                        created_at: now,
-                    })
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("insert next article_versions"))?;
+            let next_v = live.current_version + 1;
+            let an = if author_name.is_empty() {
+                None
+            } else {
+                Some(author_name.as_str())
+            };
+            let au = if author_url.is_empty() {
+                None
+            } else {
+                Some(author_url.as_str())
+            };
+            diesel::insert_into(article_versions::table)
+                .values(InsertArticleVersion {
+                    article_id: id_for_tx,
+                    version: next_v,
+                    title: title.as_str(),
+                    author_name: an,
+                    author_url: au,
+                    content: Some(&content),
+                    created_at: now,
+                })
+                .execute(conn)
+                .await
+                .map_err(tx_internal("insert next article_versions"))?;
 
-                diesel::update(
-                    articles_live::table.filter(articles_live::article_id.eq(id_for_tx)),
-                )
+            diesel::update(articles_live::table.filter(articles_live::article_id.eq(id_for_tx)))
                 .set((
                     articles_live::current_version.eq(next_v),
                     articles_live::updated_at.eq(now),
@@ -660,9 +654,7 @@ impl ArticleRepo for PgArticleRepo {
                 .await
                 .map_err(tx_internal("update articles_live"))?;
 
-                Ok::<(), TxError>(())
-            }
-            .scope_boxed()
+            Ok::<(), TxError>(())
         })
         .await?;
 
@@ -674,52 +666,47 @@ impl ArticleRepo for PgArticleRepo {
         let now = Utc::now();
         let id_for_tx = id;
 
-        conn.transaction::<_, TxError, _>(|conn| {
+        conn.transaction::<_, TxError, _>(async |conn| {
             let reason_owned = reason.clone();
-            async move {
-                let article: ArticleRow = articles::table
-                    .filter(articles::id.eq(id_for_tx))
-                    .select(ArticleRow::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(tx_internal("select articles"))?
-                    .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound {
-                        id: id_for_tx,
-                    }))?;
-                if article.state == "tombstone" {
-                    return Err(TxError::Domain(HeadlinesError::ArticleTombstoned {
-                        id: id_for_tx,
-                    }));
-                }
+            let article: ArticleRow = articles::table
+                .filter(articles::id.eq(id_for_tx))
+                .select(ArticleRow::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(tx_internal("select articles"))?
+                .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound {
+                    id: id_for_tx,
+                }))?;
+            if article.state == "tombstone" {
+                return Err(TxError::Domain(HeadlinesError::ArticleTombstoned {
+                    id: id_for_tx,
+                }));
+            }
 
-                diesel::update(articles::table.filter(articles::id.eq(id_for_tx)))
-                    .set(articles::state.eq("tombstone"))
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("update articles.state"))?;
+            diesel::update(articles::table.filter(articles::id.eq(id_for_tx)))
+                .set(articles::state.eq("tombstone"))
+                .execute(conn)
+                .await
+                .map_err(tx_internal("update articles.state"))?;
 
-                let r_ref = reason_owned.as_deref();
-                diesel::insert_into(articles_tombstone::table)
-                    .values(InsertArticleTombstone {
-                        article_id: id_for_tx,
-                        reason: r_ref,
-                        tombstoned_at: now,
-                    })
-                    .execute(conn)
-                    .await
-                    .map_err(tx_internal("insert articles_tombstone"))?;
+            let r_ref = reason_owned.as_deref();
+            diesel::insert_into(articles_tombstone::table)
+                .values(InsertArticleTombstone {
+                    article_id: id_for_tx,
+                    reason: r_ref,
+                    tombstoned_at: now,
+                })
+                .execute(conn)
+                .await
+                .map_err(tx_internal("insert articles_tombstone"))?;
 
-                diesel::delete(
-                    articles_live::table.filter(articles_live::article_id.eq(id_for_tx)),
-                )
+            diesel::delete(articles_live::table.filter(articles_live::article_id.eq(id_for_tx)))
                 .execute(conn)
                 .await
                 .map_err(tx_internal("delete articles_live"))?;
 
-                Ok::<(), TxError>(())
-            }
-            .scope_boxed()
+            Ok::<(), TxError>(())
         })
         .await?;
 
@@ -738,75 +725,70 @@ impl ArticleRepo for PgArticleRepo {
         let v = version;
         let reason = redaction_reason;
 
-        conn.transaction::<_, TxError, _>(|conn| {
-            async move {
-                // Verify the article exists (live or tombstoned).
-                let article: ArticleRow = articles::table
-                    .filter(articles::id.eq(aid))
-                    .select(ArticleRow::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(tx_internal("select articles"))?
-                    .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound { id: aid }))?;
-
-                let row: ArticleVersionRow = article_versions::table
-                    .filter(article_versions::article_id.eq(aid))
-                    .filter(article_versions::version.eq(v))
-                    .select(ArticleVersionRow::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(tx_internal("select article_versions"))?
-                    .ok_or(TxError::Domain(HeadlinesError::VersionNotFound {
-                        article_id: aid,
-                        version: v,
-                    }))?;
-                if row.redacted_at.is_some() {
-                    return Err(TxError::Domain(HeadlinesError::VersionAlreadyRedacted {
-                        article_id: aid,
-                        version: v,
-                    }));
-                }
-
-                diesel::update(
-                    article_versions::table
-                        .filter(article_versions::article_id.eq(aid))
-                        .filter(article_versions::version.eq(v)),
-                )
-                .set((
-                    article_versions::content.eq::<Option<Json>>(None),
-                    article_versions::redacted_at.eq(Some(now)),
-                    article_versions::redaction_reason.eq(Some(reason.as_str())),
-                ))
-                .execute(conn)
+        conn.transaction::<_, TxError, _>(async |conn| {
+            // Verify the article exists (live or tombstoned).
+            let article: ArticleRow = articles::table
+                .filter(articles::id.eq(aid))
+                .select(ArticleRow::as_select())
+                .first(conn)
                 .await
-                .map_err(tx_internal("redact article_versions"))?;
+                .optional()
+                .map_err(tx_internal("select articles"))?
+                .ok_or(TxError::Domain(HeadlinesError::ArticleNotFound { id: aid }))?;
 
-                // If the redacted version is the current version of a live
-                // article, bump articles_live.updated_at so the watermark
-                // stream surfaces the change.
-                if article.state == "live" {
-                    let live: ArticleLiveRow = articles_live::table
-                        .filter(articles_live::article_id.eq(aid))
-                        .select(ArticleLiveRow::as_select())
-                        .first(conn)
-                        .await
-                        .map_err(tx_internal("select articles_live for redact bump"))?;
-                    if live.current_version == v {
-                        diesel::update(
-                            articles_live::table.filter(articles_live::article_id.eq(aid)),
-                        )
+            let row: ArticleVersionRow = article_versions::table
+                .filter(article_versions::article_id.eq(aid))
+                .filter(article_versions::version.eq(v))
+                .select(ArticleVersionRow::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(tx_internal("select article_versions"))?
+                .ok_or(TxError::Domain(HeadlinesError::VersionNotFound {
+                    article_id: aid,
+                    version: v,
+                }))?;
+            if row.redacted_at.is_some() {
+                return Err(TxError::Domain(HeadlinesError::VersionAlreadyRedacted {
+                    article_id: aid,
+                    version: v,
+                }));
+            }
+
+            diesel::update(
+                article_versions::table
+                    .filter(article_versions::article_id.eq(aid))
+                    .filter(article_versions::version.eq(v)),
+            )
+            .set((
+                article_versions::content.eq::<Option<Json>>(None),
+                article_versions::redacted_at.eq(Some(now)),
+                article_versions::redaction_reason.eq(Some(reason.as_str())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(tx_internal("redact article_versions"))?;
+
+            // If the redacted version is the current version of a live
+            // article, bump articles_live.updated_at so the watermark
+            // stream surfaces the change.
+            if article.state == "live" {
+                let live: ArticleLiveRow = articles_live::table
+                    .filter(articles_live::article_id.eq(aid))
+                    .select(ArticleLiveRow::as_select())
+                    .first(conn)
+                    .await
+                    .map_err(tx_internal("select articles_live for redact bump"))?;
+                if live.current_version == v {
+                    diesel::update(articles_live::table.filter(articles_live::article_id.eq(aid)))
                         .set(articles_live::updated_at.eq(now))
                         .execute(conn)
                         .await
                         .map_err(tx_internal("bump articles_live.updated_at"))?;
-                    }
                 }
-
-                Ok::<(), TxError>(())
             }
-            .scope_boxed()
+
+            Ok::<(), TxError>(())
         })
         .await
         .map_err(HeadlinesError::from)
